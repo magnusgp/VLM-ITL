@@ -138,22 +138,22 @@ def main(config_path: str):
         output_dir=config['output_dir'],
         run_name=run_name, # Set run name for logging if supported
         num_train_epochs=config['training']['num_train_epochs'],
-        per_device_train_batch_size=config['training']['per_device_train_batch_size'],
-        per_device_eval_batch_size=config['training']['per_device_eval_batch_size'],
-        learning_rate=config['training']['learning_rate'],
-        weight_decay=config['training']['weight_decay'],
+        per_device_train_batch_size=int(config['training']['per_device_train_batch_size']),
+        per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
+        learning_rate=float(config['training']['learning_rate']),
+        weight_decay=float(config['training']['weight_decay']),
         evaluation_strategy=config['training']['evaluation_strategy'],
         save_strategy=config['training']['save_strategy'],
-        save_total_limit=config['training']['save_total_limit'],
+        save_total_limit=int(config['training']['save_total_limit']),
         load_best_model_at_end=config['training']['load_best_model_at_end'],
         metric_for_best_model=config['training']['metric_for_best_model'],
         logging_dir=os.path.join(config['output_dir'], 'logs'), # Log to output dir
-        logging_steps=config['training']['logging_steps'],
+        logging_steps=int(config['training']['logging_steps']),
         remove_unused_columns=config['training'].get('remove_unused_columns', False),
-        fp16=config['training'].get('fp16', False) and torch.cuda.is_available(),
+        fp16=bool(config['training'].get('fp16', False) and torch.cuda.is_available()),
         seed=config['seed'],
         report_to=config.get('log_with', 'none').split(','), # Support multiple reporters e.g. "wandb,tensorboard"
-        push_to_hub=config['training'].get('push_to_hub', False),
+        push_to_hub=bool(config['training'].get('push_to_hub', False)),
         # Add other TrainingArguments as needed from config
     )
     logger.info(f"FP16 enabled: {training_args.fp16}")

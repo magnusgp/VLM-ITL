@@ -5,7 +5,7 @@ seed: 42
 log_with: "wandb" # or "tensorboard", "none"
 
 dataset:
-  name: "merve/pascal-voc"
+  name: "nateraw/pascal-voc-2012"
   feature_extractor_name: "nvidia/segformer-b0-finetuned-ade-512-512"
   image_col: "image"
   mask_col: "mask"

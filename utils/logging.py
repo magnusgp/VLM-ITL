@@ -35,7 +35,10 @@ def setup_wandb(config: Dict[str, Any], run_name: str, project_name: Optional[st
                 project=resolved_project_name,
                 name=run_name,
                 config=config, # Log the entire config
-                reinit=True # Allow re-initialization in loops (like active learning)
+                reinit=True, # Allow re-initialization in loops (like active learning),
+                # turn off logging to wandb for this run
+                # mode=os.getenv("WANDB_MODE", "online") # Use online or offline mode based on environment variable
+                mode="offline"
             )
             logger.info(f"Wandb initialized successfully. Run page: {run.url}")
             return run

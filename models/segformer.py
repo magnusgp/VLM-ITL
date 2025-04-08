@@ -3,7 +3,7 @@ from typing import Dict
 import logging
 import torch
 
-from data.pascal_voc import PASCAL_VOC_ID2LABEL, PASCAL_VOC_LABEL2ID # Import mappings
+from data.pascal_voc import PASCAL_VOC_ID2LABEL, PASCAL_VOC_LABEL2ID, PASCAL_VOC_IGNORE_INDEX # Import mappings
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,8 @@ def load_model_for_segmentation(
     num_labels: int,
     id2label: Dict[int, str],
     label2id: Dict[str, int],
-    ignore_mismatched_sizes: bool = False
+    ignore_mismatched_sizes: bool = False,
+    loss_ignore_index: int = PASCAL_VOC_IGNORE_INDEX
 ) -> SegformerForSemanticSegmentation:
     """
     Loads a SegFormer model for semantic segmentation, configured for the specific dataset.
@@ -24,6 +25,7 @@ def load_model_for_segmentation(
         label2id (Dict[str, int]): Mapping from label name to label ID.
         ignore_mismatched_sizes (bool): Whether to ignore size mismatches when loading
                                         pre-trained weights (useful if changing classifier head).
+        loss_ignore_index (int): Label index to be ignored by the loss function.
 
     Returns:
         SegformerForSemanticSegmentation: The loaded and configured model.
@@ -37,6 +39,7 @@ def load_model_for_segmentation(
 
     logger.info(f"Loading SegFormer model: '{model_name_or_path}' for {num_labels} classes.")
     logger.info(f"Using id2label mapping: {id2label}")
+    logger.info(f"Setting loss ignore index to: {loss_ignore_index}") # Log the ignore index
 
     try:
         # Load the model configuration and update it for the specific dataset
@@ -45,6 +48,7 @@ def load_model_for_segmentation(
             num_labels=num_labels,
             id2label=id2label,
             label2id=label2id,
+            loss_ignore_index=loss_ignore_index
         )
 
         # Load the pre-trained model with the updated config

@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 import random
 import logging
+import torch
 from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger(__name__)
@@ -20,9 +21,10 @@ PASCAL_VOC_ID2LABEL = {i: label for i, label in enumerate(PASCAL_VOC_LABEL_NAMES
 PASCAL_VOC_LABEL2ID = {label: i for i, label in PASCAL_VOC_ID2LABEL.items()}
 NUM_PASCAL_VOC_LABELS = len(PASCAL_VOC_ID2LABEL)
 
+PASCAL_VOC_IGNORE_INDEX = 255 # Define the ignore index
 
 def load_pascal_voc_dataset(
-    dataset_name: str = "merve/pascal-voc",
+    dataset_name: str = "nateraw/pascal-voc-2012",
     cache_dir: Optional[str] = None
 ) -> DatasetDict:
     """
@@ -45,7 +47,10 @@ def load_pascal_voc_dataset(
         dataset = load_dataset(dataset_name, cache_dir=cache_dir)
 
         if "train" not in dataset or "validation" not in dataset:
-             raise ValueError(f"Dataset '{dataset_name}' does not contain 'train' and 'validation' splits.")
+            if "val" not in dataset:
+                raise ValueError(f"Dataset '{dataset_name}' does not contain 'train' or 'validation' splits.")
+            # If 'val' is present, we can rename it to 'validation'
+            dataset["validation"] = dataset.pop("val")
 
         # Rename 'validation' to 'test' for clarity in our pipeline
         dataset["test"] = dataset.pop("validation")
@@ -108,7 +113,8 @@ def preprocess_data(
     batch: Dict[str, Any],
     image_processor: SegformerImageProcessor,
     image_col: str = "image",
-    mask_col: str = "mask"
+    mask_col: str = "mask",
+    ignore_index: int = PASCAL_VOC_IGNORE_INDEX
 ) -> Dict[str, Any]:
     """
     Preprocesses a batch of data using the SegformerImageProcessor.
@@ -123,6 +129,8 @@ def preprocess_data(
     Returns:
         Dict[str, Any]: The processed batch, typically containing 'pixel_values' and 'labels'.
     """
+    logger.debug(f"Columns: {batch.keys()}, Image Col: {image_col}, Mask Col: {mask_col}")
+    # Extract images and masks from the batch
     images = batch[image_col]
     segmentation_masks = batch[mask_col]
 
@@ -140,14 +148,16 @@ def preprocess_data(
     # Process images and masks
     # The processor handles resizing, normalization for images,
     # and potentially resizing for masks (check reduce_labels argument).
-    # `do_reduce_labels=True` (default for some processors) expects labels 0 to N-1.
-    # If your mask has an ignore index like 255, you might need `do_reduce_labels=False`
-    # or handle it manually. Let's assume PASCAL VOC masks are 0-20.
+    # We use ignore_index=255 for the masks to ignore borders, so we set it to 255
+    # We need to use do_reduce_labels=False to keep the original labels
     try:
         inputs = image_processor(
             images,
-            segmentation_maps=processed_masks,
-            return_tensors="pt" # Return PyTorch tensors
+            segmentation_masks=processed_masks,
+            return_tensors="pt", # Return PyTorch tensors
+            # We can set do_reduce_labels=False to keep the original labels
+            do_reduce_labels=False, # Keep original labels
+            ignore_index=ignore_index,
         )
         # The output dict keys depend on the processor version, usually:
         # 'pixel_values': FloatTensor (batch, channels, height, width)
@@ -177,7 +187,7 @@ if __name__ == "__main__":
         print(pascal_dataset_dict)
         # Access a sample
         sample = pascal_dataset_dict["train"][0]
-        print("\nSample data point:")
+        print("\nSample data point keys:", sample.keys())
         print(f"Image type: {type(sample['image'])}, size: {sample['image'].size}, mode: {sample['image'].mode}")
         print(f"Mask type: {type(sample['mask'])}, size: {sample['mask'].size}, mode: {sample['mask'].mode}")
         # Check mask values (should be within 0-20 or 255 for borders if present)
@@ -197,6 +207,7 @@ if __name__ == "__main__":
         # Create a small batch for testing
         batch_size = 4
         test_batch = pascal_dataset_dict["train"][:batch_size] # This returns a Dict[str, List]
+        print(f"\nKeys in batch: {test_batch.keys()}\n")
 
         # Preprocess the batch
         processed_batch = preprocess_data(test_batch, image_processor)
