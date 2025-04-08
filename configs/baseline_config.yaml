@@ -1,0 +1,33 @@
+project_name: "pascal-voc-segmentation"
+run_name: "baseline-segformer-b0"
+output_dir: "./results/baseline"
+seed: 42
+log_with: "wandb" # or "tensorboard", "none"
+
+dataset:
+  name: "merve/pascal-voc"
+  feature_extractor_name: "nvidia/segformer-b0-finetuned-ade-512-512"
+  image_col: "image"
+  mask_col: "mask"
+  val_split_percentage: 0.1 # Use 10% of train as validation
+
+model:
+  name: "nvidia/segformer-b0-finetuned-ade-512-512"
+  num_labels: 21 # PASCAL VOC has 21 classes (20 objects + background)
+  ignore_mismatched_sizes: True # Needed if fine-tuning head
+
+training:
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  num_train_epochs: 10
+  learning_rate: 6e-5 # Default Segformer LR
+  weight_decay: 0.01
+  evaluation_strategy: "epoch"
+  save_strategy: "epoch"
+  save_total_limit: 3
+  load_best_model_at_end: True
+  metric_for_best_model: "mean_iou"
+  logging_steps: 50
+  remove_unused_columns: False # Important for custom preprocessing
+  fp16: True # Enable mixed precision if GPU supports it
+  push_to_hub: False # Set to true to push model to Hugging Face Hub
