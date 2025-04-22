@@ -12,13 +12,14 @@ dataset:
   val_split_percentage: 0.1 # Use 10% of train as validation
 
 model:
-  name: "nvidia/segformer-b0-finetuned-ade-512-512"
+  name: "nvidia/segformer-b4-finetuned-ade-512-512"
   num_labels: 21 # PASCAL VOC has 21 classes (20 objects + background)
   ignore_mismatched_sizes: True # Needed if fine-tuning head
 
 training:
   per_device_train_batch_size: 8
   per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 2
   num_train_epochs: 10
   learning_rate: 6e-5 # Default Segformer LR
   weight_decay: 0.01
@@ -31,3 +32,9 @@ training:
   remove_unused_columns: False # Important for custom preprocessing
   fp16: True # Enable mixed precision if GPU supports it
   push_to_hub: False # Set to true to push model to Hugging Face Hub
+  lr_scheduler_type: "polynomial"
+  lr_scheduler_kwargs:
+    power: 1.0
+    end_learning_rate: 0.0
+  warmup_ratio: 0.1
+  # early_stopping_patience: 5 
