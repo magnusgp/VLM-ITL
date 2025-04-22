@@ -134,40 +134,49 @@ def preprocess_data(
     images = batch[image_col]
     segmentation_masks = batch[mask_col]
 
-    # Ensure masks are in the correct format (e.g., 'L' mode for labels) if necessary
-    # Sometimes masks might be RGB, convert them
-    processed_masks = []
-    for mask in segmentation_masks:
-        if mask.mode != 'L':
-            # This conversion might depend on how labels are encoded in RGB
-            # Assuming simple conversion works, otherwise more complex mapping needed
-            mask = mask.convert('L')
-        processed_masks.append(mask)
+    try: # Process images to get pixel_values
+        if not isinstance(images, (list, tuple)):
+            images = [images]
 
-
-    # Process images and masks
-    # The processor handles resizing, normalization for images,
-    # and potentially resizing for masks (check reduce_labels argument).
-    # We use ignore_index=255 for the masks to ignore borders, so we set it to 255
-    # We need to use do_reduce_labels=False to keep the original labels
-    try:
         inputs = image_processor(
             images,
-            segmentation_masks=processed_masks,
-            return_tensors="pt", # Return PyTorch tensors
-            # We can set do_reduce_labels=False to keep the original labels
-            do_reduce_labels=False, # Keep original labels
-            ignore_index=ignore_index,
+            return_tensors="pt"
         )
-        # The output dict keys depend on the processor version, usually:
-        # 'pixel_values': FloatTensor (batch, channels, height, width)
-        # 'labels': LongTensor (batch, height, width)
+        # For masks, since the processor might not process them, add a manual step:
+        raw_masks = segmentation_masks
+        if not isinstance(raw_masks, (list, tuple)):
+            raw_masks = [raw_masks]
+
+        # Log the original mask sizes for debugging
+        mask_sizes = [f"{mask.size}" if hasattr(mask, "size") else "N/A" for mask in raw_masks]
+        
+        # Process masks: convert to grayscale if needed, resize using nearest-neighbor,
+        # and then convert to tensor.
+        processed_masks = []
+        for mask in raw_masks:
+            if mask.mode != 'L':
+                mask = mask.convert('L')
+            mask_resized = mask.resize((image_processor.size["width"], image_processor.size["height"]), Image.NEAREST)
+            processed_masks.append(torch.tensor(np.array(mask_resized), dtype=torch.long))
+            
+        # Stack masks and add a channel dimension
+        labels_tensor = torch.stack(processed_masks)
+        labels_tensor = labels_tensor.unsqueeze(1)
+        inputs["labels"] = labels_tensor
+
         return inputs
+    
+    except ValueError as ve:
+        logger.error(f"ValueError during image processing: {ve}", exc_info=True)
+        try:
+            img = images[0]
+            msk = processed_masks[0]
+            logger.error(f"Failed processing image size {img.size} mode {img.mode}, mask size {msk.size} mode {msk.mode}")
+        except:
+            pass
+        raise # Re-raise the exception
     except Exception as e:
         logger.error(f"Error during image processing: {e}", exc_info=True)
-        # What to return on error? Maybe skip the batch or return empty?
-        # Returning empty might cause issues downstream. Re-raise or log carefully.
-        # Let's log one image that failed if possible
         try:
             img = images[0]
             msk = processed_masks[0]
@@ -230,8 +239,8 @@ if __name__ == "__main__":
         # Check a sample from the processed dataset
         processed_sample = processed_dataset[0]
         print("\nSample from processed dataset:")
-        print("Pixel values shape:", processed_sample['pixel_values'].shape) # Should be [3, H, W] - PyTorch tensor now
-        print("Labels shape:", processed_sample['labels'].shape) # Should be [H, W] - PyTorch tensor now
+        print("Pixel values shape:", type(processed_sample['pixel_values'])) # Should be [3, H, W] - PyTorch tensor now
+        print("Labels shape:", type(processed_sample['labels'])) # Should be [H, W] - PyTorch tensor now
 
         print("\nPreprocessing tests successful.")
 

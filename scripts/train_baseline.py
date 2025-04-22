@@ -11,14 +11,14 @@ sys.path.insert(0, project_root)
 import torch
 from transformers import (
     TrainingArguments,
-    Trainer,
+    Trainer, # Import base Trainer
     SegformerImageProcessor,
     set_seed
 )
 from datasets import DatasetDict
 
 from utils.config import load_config
-from utils.logging import setup_wandb, logger # Use the configured logger
+from utils.logging import setup_wandb, logger
 from utils.metrics import compute_metrics_segmentation
 from data.pascal_voc import (
     load_pascal_voc_dataset,
@@ -26,9 +26,47 @@ from data.pascal_voc import (
     create_train_val_test_splits,
     PASCAL_VOC_ID2LABEL,
     PASCAL_VOC_LABEL2ID,
-    NUM_PASCAL_VOC_LABELS
+    NUM_PASCAL_VOC_LABELS,
+    PASCAL_VOC_IGNORE_INDEX # Make sure ignore index is accessible if needed
 )
 from models.segformer import load_model_for_segmentation
+
+class SegmentationTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """
+        How the loss is computed by Trainer. By default, all models return a tuple checking if labels were provided or not.
+        We override this behavior here to explicitly pass labels AND retrieve the loss.
+        Note, that the only other kwarg input here is num_items_in_batch, which is not used in this case.
+        """
+        # Prepare inputs
+        logger.info("Inputs to compute_loss:", inputs)
+        logger.info(f"Inputs keys: {inputs.keys()}")
+        labels = inputs.pop("labels", None) # Extract labels ensure they are not passed directly if model handles them internally
+        pixel_values = inputs.get("pixel_values")
+
+        if labels is None:
+            logger.warning("No labels provided in inputs. Loss cannot be computed.")
+            raise ValueError("Labels must be provided in inputs to compute loss.")
+        if pixel_values is None:
+            logger.warning("No pixel values provided in inputs. Loss cannot be computed.")
+            raise ValueError("Both 'pixel_values' and 'labels' must be in inputs to compute loss.")
+
+        # Forward pass
+        outputs = model(pixel_values=pixel_values, labels=labels)
+
+        # Check if the model returned loss directly (it should for SegFormer when labels are passed)
+        if hasattr(outputs, 'loss') and outputs.loss is not None:
+            loss = outputs.loss
+        else:
+            # This case should ideally not be hit if labels were passed correctly
+            logger.warning("Model output did not contain 'loss' attribute despite labels being provided.")
+            # Fallback: Try to access loss by key if it's a dict (less likely for Segformer output obj)
+            if isinstance(outputs, dict) and "loss" in outputs:
+                loss = outputs["loss"]
+            else:
+                raise ValueError("Could not retrieve loss from model output.")
+
+        return (loss, outputs) if return_outputs else loss
 
 def main(config_path: str):
     """Main function for the baseline training script."""
@@ -38,7 +76,7 @@ def main(config_path: str):
 
     # --- 2. Setup Logging & Seed ---
     run_name = config.get('run_name', 'baseline_run_unnamed')
-    setup_wandb(config, run_name=run_name) # Initialize wandb if configured
+    setup_wandb(config, run_name=run_name)
     set_seed(config['seed'])
     logger.info(f"Seed set to {config['seed']}")
     if torch.cuda.is_available():
@@ -49,46 +87,29 @@ def main(config_path: str):
 
     # --- 3. Load and Prepare Data ---
     logger.info("Loading PASCAL VOC dataset...")
-    # Load the raw dataset
     raw_datasets = load_pascal_voc_dataset(
-        dataset_name=config['dataset']['name'],
-        cache_dir=config['dataset'].get('cache_dir') # Optional cache dir
+        dataset_name=config['dataset']['name'], # Use name from config
+        cache_dir=config['dataset'].get('cache_dir')
     )
-
-    # Split the original 'train' data into train/val/test for the baseline experiment
-    # The original 'validation' split from HF is treated as a hold-out test set by load_pascal_voc_dataset
-    # We re-split the 'train' split to get our own val/test sets if specified percentages are > 0
     train_val_test_needed = config['dataset'].get('val_split_percentage', 0) > 0 or \
                              config['dataset'].get('test_split_percentage', 0) > 0
-
     if train_val_test_needed:
         logger.info("Splitting 'train' dataset into train/validation/test sets...")
         train_ds, val_ds, test_ds = create_train_val_test_splits(
             raw_datasets['train'],
             val_percentage=config['dataset'].get('val_split_percentage', 0.1),
-            test_percentage=config['dataset'].get('test_split_percentage', 0.1), # Using a test split from train
+            test_percentage=config['dataset'].get('test_split_percentage', 0.1),
             seed=config['seed']
         )
-        # Keep the original test set aside if needed, or overwrite with the split one
-        # Let's use the split one for consistency in the baseline evaluation
-        prepared_datasets = DatasetDict({
-            'train': train_ds,
-            'validation': val_ds,
-            'test': test_ds
-        })
+        prepared_datasets = DatasetDict({ 'train': train_ds, 'validation': val_ds, 'test': test_ds })
         logger.info("Using train/val/test splits derived from the original 'train' split.")
     else:
-        # Use original train/test splits if no percentages given (test is original val)
+        # Use original train/test (original val renamed to test)
         logger.info("Using original 'train' and 'test' (renamed 'validation') splits.")
-        prepared_datasets = DatasetDict({
-            'train': raw_datasets['train'],
-             # No validation set in this case, Trainer can handle this
-            'test': raw_datasets['test']
-        })
-        # Create a dummy validation set if needed by evaluation strategy
+        prepared_datasets = DatasetDict({ 'train': raw_datasets['train'], 'test': raw_datasets['test'] })
         if config['training']['evaluation_strategy'] != "no":
              logger.warning("No validation split specified. Using test set for evaluation during training.")
-             prepared_datasets['validation'] = raw_datasets['test'] # Use test set for eval
+             prepared_datasets['validation'] = raw_datasets['test']
 
     logger.info(f"Final dataset splits: {prepared_datasets}")
 
@@ -96,31 +117,31 @@ def main(config_path: str):
     logger.info("Loading Image Processor...")
     image_processor = SegformerImageProcessor.from_pretrained(
         config['dataset']['feature_extractor_name'],
-        do_reduce_labels=False # Handle labels 0-20 correctly
-    )
-
+        size={"height": 512, "width": 512},
+        do_resize=True,
+        do_reduce_labels=True)
     logger.info("Applying preprocessing to datasets...")
-    # Create a partial function for map
     preprocess_fn = partial(
         preprocess_data,
         image_processor=image_processor,
         image_col=config['dataset']['image_col'],
         mask_col=config['dataset']['mask_col']
     )
+    # Pick the first 2 examples from the dataset
+    sample_examples = prepared_datasets["train"].select(range(2))
+    for example in sample_examples:
+        processed = preprocess_data(example, image_processor=image_processor, image_col=config['dataset']['image_col'], mask_col=config['dataset']['mask_col'])
+        logger.info(f"Sample processed pixel_values shape: {processed['pixel_values'].shape}")
+        logger.info(f"Sample processed labels shape: {processed['labels'].shape}")
 
-    # Apply preprocessing using `map`
     processed_datasets = prepared_datasets.map(
         preprocess_fn,
         batched=True,
-        batch_size=config['training']['per_device_train_batch_size'] * 2, # Process faster
-        remove_columns=raw_datasets['train'].column_names # Remove old columns
+        batch_size=config['training']['per_device_train_batch_size'],
     )
-
-    # Set format to PyTorch tensors
-    processed_datasets.set_format("torch")
+    processed_datasets.set_format("torch", columns=["pixel_values", "labels"])
     logger.info("Preprocessing complete.")
     logger.info(f"Processed dataset features: {processed_datasets['train'].features}")
-
 
     # --- 5. Load Model ---
     logger.info("Loading segmentation model...")
@@ -129,25 +150,26 @@ def main(config_path: str):
         num_labels=NUM_PASCAL_VOC_LABELS,
         id2label=PASCAL_VOC_ID2LABEL,
         label2id=PASCAL_VOC_LABEL2ID,
-        ignore_mismatched_sizes=config['model'].get('ignore_mismatched_sizes', False)
+        ignore_mismatched_sizes=config['model'].get('ignore_mismatched_sizes', False),
+        loss_ignore_index=PASCAL_VOC_IGNORE_INDEX
     )
 
     # --- 6. Configure Training Arguments ---
     logger.info("Configuring Training Arguments...")
     training_args = TrainingArguments(
         output_dir=config['output_dir'],
-        run_name=run_name, # Set run name for logging if supported
+        run_name=run_name,
         num_train_epochs=config['training']['num_train_epochs'],
         per_device_train_batch_size=int(config['training']['per_device_train_batch_size']),
         per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
         learning_rate=float(config['training']['learning_rate']),
         weight_decay=float(config['training']['weight_decay']),
-        evaluation_strategy=config['training']['evaluation_strategy'],
+        eval_strategy=config['training']['evaluation_strategy'],
         save_strategy=config['training']['save_strategy'],
         save_total_limit=int(config['training']['save_total_limit']),
         load_best_model_at_end=config['training']['load_best_model_at_end'],
         metric_for_best_model=config['training']['metric_for_best_model'],
-        logging_dir=os.path.join(config['output_dir'], 'logs'), # Log to output dir
+        logging_dir=os.path.join(config['output_dir'], 'logs'),
         logging_steps=int(config['training']['logging_steps']),
         remove_unused_columns=config['training'].get('remove_unused_columns', False),
         fp16=bool(config['training'].get('fp16', False) and torch.cuda.is_available()),
@@ -157,58 +179,51 @@ def main(config_path: str):
         # Add other TrainingArguments as needed from config
     )
     logger.info(f"FP16 enabled: {training_args.fp16}")
+    # Add explicit log for remove_unused_columns value being used
+    logger.info(f"Using remove_unused_columns: {training_args.remove_unused_columns}")
 
 
     # --- 7. Initialize Trainer ---
     logger.info("Initializing Trainer...")
-    # Create partial function for compute_metrics
     compute_metrics_fn = partial(
         compute_metrics_segmentation,
         num_labels=NUM_PASCAL_VOC_LABELS,
-        ignore_index=255 # SegformerImageProcessor might pad with 255
+        ignore_index=PASCAL_VOC_IGNORE_INDEX # Use the correct ignore index here too
     )
 
-    trainer = Trainer(
+    # Use the custom SegmentationTrainer
+    trainer = SegmentationTrainer(
         model=model,
         args=training_args,
         train_dataset=processed_datasets["train"],
-        eval_dataset=processed_datasets.get("validation"), # Optional, uses test if 'validation' not present & eval needed
+        eval_dataset=processed_datasets.get("validation"),
         compute_metrics=compute_metrics_fn,
-        # Data collator is usually handled internally for CV tasks if data is processed correctly
+        # No custom data collator needed usually
     )
 
     # --- 8. Train ---
     logger.info("Starting training...")
-    train_result = trainer.train()
+    train_result = trainer.train() # This should now use the custom compute_loss
     logger.info("Training finished.")
-
-    # Log training metrics
     metrics = train_result.metrics
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
-    trainer.save_state() # Saves tokenizer, config, model, etc.
+    trainer.save_state()
     logger.info(f"Training metrics: {metrics}")
 
-
-    # --- 9. Evaluate ---
     if processed_datasets.get("test") is not None:
         logger.info("Starting evaluation on the test set...")
         eval_metrics = trainer.evaluate(eval_dataset=processed_datasets["test"])
-
-        # Log evaluation metrics
         trainer.log_metrics("eval", eval_metrics)
-        trainer.save_metrics("eval", eval_metrics) # Saves to output_dir/eval_results.json
+        trainer.save_metrics("eval", eval_metrics)
         logger.info(f"Evaluation metrics on test set: {eval_metrics}")
     else:
-        logger.warning("No test set found in processed datasets. Skipping final evaluation.")
+        logger.warning("No test set found. Skipping final evaluation.")
 
-
-    # --- 10. Save Final Model & Finish Logging ---
     logger.info("Saving the final model...")
-    trainer.save_model(os.path.join(config['output_dir'], "final_model")) # Save best model (if load_best_model_at_end=True)
+    trainer.save_model(os.path.join(config['output_dir'], "final_model"))
     logger.info(f"Model saved to {os.path.join(config['output_dir'], 'final_model')}")
 
-    # Finish wandb run if it was initialized
     if config.get('log_with') == 'wandb' and trainer.is_world_process_zero():
         import wandb
         wandb.finish()
@@ -226,7 +241,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Setup basic logging configuration for the script itself
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -236,5 +250,6 @@ if __name__ == "__main__":
     try:
         main(args.config)
     except Exception as e:
+        # Log the exception with traceback before exiting
         logger.error("An error occurred during the baseline training pipeline.", exc_info=True)
         sys.exit(1)
