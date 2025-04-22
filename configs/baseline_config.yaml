@@ -1,15 +1,16 @@
 project_name: "pascal-voc-segmentation"
-run_name: "baseline-segformer-b0"
-output_dir: "./results/baseline"
+run_name: "baseline-segformer-b4"
+output_dir: "./results/baseline/b4"
 seed: 42
 log_with: "wandb" # or "tensorboard", "none"
 
 dataset:
   name: "nateraw/pascal-voc-2012"
-  feature_extractor_name: "nvidia/segformer-b0-finetuned-ade-512-512"
+  feature_extractor_name: "nvidia/segformer-b4-finetuned-ade-512-512"
   image_col: "image"
   mask_col: "mask"
   val_split_percentage: 0.1 # Use 10% of train as validation
+  load_from_cache_file: True # Set to True to use cached dataset
 
 model:
   name: "nvidia/segformer-b4-finetuned-ade-512-512"
@@ -17,9 +18,9 @@ model:
   ignore_mismatched_sizes: True # Needed if fine-tuning head
 
 training:
-  per_device_train_batch_size: 8
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 2
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 1
   num_train_epochs: 10
   learning_rate: 6e-5 # Default Segformer LR
   weight_decay: 0.01
@@ -34,7 +35,7 @@ training:
   push_to_hub: False # Set to true to push model to Hugging Face Hub
   lr_scheduler_type: "polynomial"
   lr_scheduler_kwargs:
-    power: 1.0
-    end_learning_rate: 0.0
+    power: 2.0
+    lr_end: 0.0
   warmup_ratio: 0.1
   # early_stopping_patience: 5 

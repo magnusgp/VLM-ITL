@@ -195,29 +195,38 @@ def run_active_learning_pipeline(config_path: str):
         # Configure Training Arguments for THIS iteration
         # Make a copy to avoid side effects if looping TrainingArguments object
         iter_training_args = TrainingArguments(
-            output_dir=iter_output_dir,
-            run_name=iter_run_name, # Pass run name
-            # Load relevant params from main config's training section
-            num_train_epochs=config['training']['num_train_epochs'],
-            per_device_train_batch_size=config['training']['per_device_train_batch_size'],
-            per_device_eval_batch_size=config['training']['per_device_eval_batch_size'],
-            learning_rate=config['training']['learning_rate'],
-            weight_decay=config['training']['weight_decay'],
-            evaluation_strategy=config['training']['evaluation_strategy'],
-            save_strategy=config['training']['save_strategy'],
-            save_total_limit=config['training']['save_total_limit'], # Keep only best model from this iteration
-            load_best_model_at_end=config['training']['load_best_model_at_end'],
-            metric_for_best_model=config['training']['metric_for_best_model'],
+            output_dir=str(iter_output_dir),
+            run_name=str(iter_run_name),
+
+            # ints
+            num_train_epochs=int(config['training']['num_train_epochs']),
+            per_device_train_batch_size=int(config['training']['per_device_train_batch_size']),
+            per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
+            save_total_limit=int(config['training']['save_total_limit']),
+            logging_steps=int(config['training']['logging_steps']),
+            seed=int(config['seed']),
+
+            # floats
+            learning_rate=float(config['training']['learning_rate']),
+            weight_decay=float(config['training']['weight_decay']),
+
+            # strings
+            eval_strategy=str(config['training']['evaluation_strategy']),
+            save_strategy=str(config['training']['save_strategy']),
+            metric_for_best_model=str(config['training']['metric_for_best_model']),
+
+            # booleans
+            load_best_model_at_end=bool(config['training']['load_best_model_at_end']),
+            remove_unused_columns=bool(config['training'].get('remove_unused_columns', False)),
+            fp16=bool(config['training'].get('fp16', False) and torch.cuda.is_available()),
+
+            # logging / reporting
             logging_dir=os.path.join(iter_output_dir, 'logs'),
-            logging_steps=config['training']['logging_steps'],
-            remove_unused_columns=config['training'].get('remove_unused_columns', False),
-            fp16=config['training'].get('fp16', False) and torch.cuda.is_available(),
-            seed=config['seed'], # Keep seed consistent across trainers? Or change? Let's keep it.
-            report_to=config.get('log_with', 'none').split(','),
-            push_to_hub=False, # Disable pushing intermediate models
-            # Force logging steps even if dataset is small for visibility
             logging_first_step=True,
-            # Disable default progress bar maybe, or keep it per iteration? Keep it.
+            report_to=[x.strip() for x in str(config.get('log_with', 'none')).split(',') if x.strip()],
+
+            # never push these interim checkpoints
+            push_to_hub=False
         )
 
         # Initialize compute_metrics function (needed for Trainer)

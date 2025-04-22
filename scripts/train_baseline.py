@@ -137,7 +137,7 @@ def main(config_path: str):
         config['dataset']['feature_extractor_name'],
         size={"height": 512, "width": 512},
         do_resize=True,
-        do_reduce_labels=True
+        do_reduce_labels=False,
     )
 
     logger.info("Applying preprocessing to datasets...")
@@ -164,7 +164,7 @@ def main(config_path: str):
         preprocess_fn,
         batched=True,
         batch_size=config['training']['per_device_train_batch_size'],
-        load_from_cache_file=True
+        load_from_cache_file=config['dataset'].get('load_from_cache_file', True),
     )
     processed_datasets.set_format("torch", columns=["pixel_values", "labels"])
     logger.info("Preprocessing complete.")
@@ -183,7 +183,8 @@ def main(config_path: str):
 
     # --- 6. Configure Training Arguments ---
     logger.info("Configuring Training Arguments...")
-    training_args = TrainingArguments(
+    try:
+        training_args = TrainingArguments(
         output_dir=config['output_dir'],
         run_name=run_name,
         num_train_epochs=config['training']['num_train_epochs'],
@@ -191,13 +192,16 @@ def main(config_path: str):
         per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
         learning_rate=float(config['training']['learning_rate']),
         weight_decay=float(config['training']['weight_decay']),
-        evaluation_strategy=config['training']['evaluation_strategy'],
+        eval_strategy=config['training']['evaluation_strategy'],
         save_strategy=config['training']['save_strategy'],
         save_total_limit=int(config['training']['save_total_limit']),
         load_best_model_at_end=config['training']['load_best_model_at_end'],
         metric_for_best_model=config['training']['metric_for_best_model'],
         logging_dir=os.path.join(config['output_dir'], 'logs'),
         lr_scheduler_type=config['training']['lr_scheduler_type'],
+        lr_scheduler_kwargs=config['training'].get('lr_scheduler_kwargs', {}),
+        warmup_ratio=float(config['training'].get('warmup_ratio', 0.0)),
+        # early_stopping_patience=int(config['training'].get('early_stopping_patience', 0)),
         logging_steps=int(config['training']['logging_steps']),
         remove_unused_columns=config['training'].get('remove_unused_columns', False),
         fp16=bool(config['training'].get('fp16', False) and torch.cuda.is_available()),
@@ -205,6 +209,30 @@ def main(config_path: str):
         report_to=config.get('log_with', 'none').split(','),  # e.g. "wandb,tensorboard"
         push_to_hub=bool(config['training'].get('push_to_hub', False)),
     )
+    except TypeError as e:
+        logging.error(f"Transformers module mismatch. Please check the version. ({e})")    
+        training_args = TrainingArguments(
+            output_dir=config['output_dir'],
+            run_name=run_name,
+            num_train_epochs=config['training']['num_train_epochs'],
+            per_device_train_batch_size=int(config['training']['per_device_train_batch_size']),
+            per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
+            learning_rate=float(config['training']['learning_rate']),
+            weight_decay=float(config['training']['weight_decay']),
+            evaluation_strategy=config['training']['evaluation_strategy'],
+            save_strategy=config['training']['save_strategy'],
+            save_total_limit=int(config['training']['save_total_limit']),
+            load_best_model_at_end=config['training']['load_best_model_at_end'],
+            metric_for_best_model=config['training']['metric_for_best_model'],
+            logging_dir=os.path.join(config['output_dir'], 'logs'),
+            lr_scheduler_type=config['training']['lr_scheduler_type'],
+            logging_steps=int(config['training']['logging_steps']),
+            remove_unused_columns=config['training'].get('remove_unused_columns', False),
+            fp16=bool(config['training'].get('fp16', False) and torch.cuda.is_available()),
+            seed=config['seed'],
+            report_to=config.get('log_with', 'none').split(','),  # e.g. "wandb,tensorboard"
+            push_to_hub=bool(config['training'].get('push_to_hub', False)),
+        )
     logger.info(f"FP16 enabled: {training_args.fp16}")
     logger.info(f"Using remove_unused_columns: {training_args.remove_unused_columns}")
 
