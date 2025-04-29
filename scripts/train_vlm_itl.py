@@ -113,36 +113,30 @@ def simulate_vlm_feedback_on_batch(
     # Iterate through batch items for VLM feedback
     for i in range(len(images)):
         original_image = images[i]
-        gt_mask_pil = gt_masks[i].convert('P') # Ensure ground truth is grayscale
+        gt_mask_pil = gt_masks[i]
+        
         pred_mask_np = predicted_mask_tensor[i].cpu().numpy().astype(np.uint8)
-        pred_mask_pil = Image.fromarray(pred_mask_np, mode='P')
+        pred_mask_pil = Image.fromarray(pred_mask_np, mode='L')
+        
+        gt_mask_np = processed_inputs["labels"][i].cpu().numpy().astype(np.uint8)
 
-        # --- VLM Interaction Logic ---
-        # Here, we need to decide WHAT to ask the VLM. The prompt asks for
-        # binary feedback on quality/correctness related to GT.
-        # Let's compare the *dominant* predicted label vs dominant GT label for simplicity.
-        # More sophisticated: Ask about specific regions or objects.
+        # Find dominant predicted label (excluding background=0 and ignore=255)
+        valid_pred = (pred_mask_np != 255) & (pred_mask_np != 0)
+        pred_labels, pred_counts = np.unique(
+            pred_mask_np[valid_pred],
+            return_counts=True
+        )
+        dominant_pred_label_id = pred_labels[np.argmax(pred_counts)] if len(pred_labels) > 0 else -1
 
-        # Find dominant predicted label (excluding background=0 maybe?)
-        pred_labels, pred_counts = np.unique(pred_mask_np[pred_mask_np != 0], return_counts=True)
-        dominant_pred_label_id = pred_labels[np.argmax(pred_counts)] if len(pred_labels) > 0 else 0
-
-        # Find dominant ground truth label
-        gt_mask_np = np.array(gt_mask_pil)
-        gt_labels, gt_counts = np.unique(gt_mask_np[gt_mask_np != 0], return_counts=True)
-        logger.info(f"Predicted Labels: {pred_labels}, GT Labels: {gt_labels}, GT Counts: {gt_counts}")
-        dominant_gt_label_id = gt_labels[np.argmax(gt_counts)] if len(gt_labels) > 0 else 0
-        logger.info(f"Dominant Predicted Label ID: {dominant_pred_label_id}, Dominant GT Label ID: {dominant_gt_label_id}")
+        # Find dominant ground truth label (excluding background=0 and ignore=255)
+        valid_gt = (gt_mask_np != 255) & (gt_mask_np != 0)
+        gt_labels, gt_counts = np.unique(
+            gt_mask_np[valid_gt],
+            return_counts=True
+        )
+        dominant_gt_label_id = gt_labels[np.argmax(gt_counts)] if len(gt_labels) > 0 else -1
         predicted_label_name = PASCAL_VOC_ID2LABEL.get(dominant_pred_label_id, "unknown")
         ground_truth_label_name = PASCAL_VOC_ID2LABEL.get(dominant_gt_label_id, "unknown")
-        logger.info(f"Predicted Label Name: {predicted_label_name}, GT Label Name: {ground_truth_label_name}")
-        # save the iamge for debugging
-        debug_dir = config.get('vlm_itl', {}).get('debug_dir', './vlm_debug')
-        os.makedirs(debug_dir, exist_ok=True)
-        original_image.save(os.path.join(debug_dir, f"original_{i}.png"))
-        gt_mask_pil.save(os.path.join(debug_dir, f"gt_mask_{i}.png"))
-        pred_mask_pil.save(os.path.join(debug_dir, f"pred_mask_{i}.png"))
-        exit(1)
 
         # Get feedback from VLM handler
         feedback = vlm_handler.get_vlm_feedback(
