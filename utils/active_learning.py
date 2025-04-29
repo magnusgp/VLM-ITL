@@ -8,7 +8,7 @@ import os
 
 from transformers import Trainer, TrainingArguments, TrainerCallback, TrainerState, TrainerControl
 from .vlm import VLMHandler # Import VLM handler
-from .logging import log_active_learning_summary # Import summary logger
+from .log_utils import log_active_learning_summary # Import summary logger
 import wandb
 
 

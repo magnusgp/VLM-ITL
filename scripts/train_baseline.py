@@ -18,7 +18,7 @@ from transformers import (
 from datasets import DatasetDict
 
 from utils.config import load_config
-from utils.logging import setup_wandb, logger
+from utils.log_utils import setup_wandb, logger
 from utils.metrics import compute_metrics_segmentation
 from data.pascal_voc import (
     load_pascal_voc_dataset,

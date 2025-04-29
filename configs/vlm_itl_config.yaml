@@ -1,0 +1,50 @@
+project_name: "pascal-voc-segmentation"
+run_name_prefix: "vlm-itl-segformer-b0" # Run name will be appended with iteration info
+output_dir_prefix: "./results/active_learning" # Output dir will be appended
+seed: 42
+log_with: "wandb"
+
+dataset:
+  name: "nateraw/pascal-voc-2012"
+  feature_extractor_name: "nvidia/segformer-b0-finetuned-ade-512-512"
+  image_col: "image"
+  mask_col: "mask"
+  val_split_percentage: 0.1 # Use 10% of train as validation (fixed across iterations)
+  test_split_percentage: 0.1 # Use 10% of train as test (fixed across iterations)
+
+
+model:
+  name: "nvidia/segformer-b0-finetuned-ade-512-512"
+  num_labels: 21
+  ignore_mismatched_sizes: True
+
+training: # Params per Active Learning Iteration
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  num_train_epochs: 5 # Fewer epochs per iteration? Or same as baseline? Let's use fewer.
+  learning_rate: 6e-5
+  weight_decay: 0.01
+  evaluation_strategy: "epoch"
+  save_strategy: "epoch"
+  save_total_limit: 1 # Only keep the best from the current iteration
+  load_best_model_at_end: True
+  metric_for_best_model: "mean_iou"
+  logging_steps: 20
+  remove_unused_columns: False
+  fp16: True
+  push_to_hub: False
+
+active_learning:
+  initial_percentage: 0.1 # Start with 10% of training data
+  increment_percentage: 0.1 # Add 10% each iteration
+  max_percentage: 1.0 # Go up to 100%
+  sampling_strategy: "random" # Could be extended (e.g., "uncertainty")
+
+vlm_itl: # Configuration for the VLM-ITL run (can be in the same file or separate)
+  enabled: True # Set to True for the VLM-ITL script
+  run_name_prefix: "vlm-itl-segformer-b0"
+  output_dir_prefix: "./results/vlm_itl"
+  vlm_handler: "huggingface_blip" # Type of VLM handler ('mock', 'huggingface_blip', etc.)
+  vlm_options: # Options passed to VLM handler constructor
+    mock_accuracy: 0.85 # If using mock handler
+  vlm_query_template: "Is the primary object in this segmented region correctly identified as {label_name}?"

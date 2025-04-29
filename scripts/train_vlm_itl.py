@@ -26,7 +26,7 @@ from transformers import (
 from datasets import Dataset, DatasetDict, concatenate_datasets
 
 from utils.config import load_config
-from utils.logging import setup_wandb, logger, log_active_learning_summary
+from utils.log_utils import setup_wandb, logger, log_active_learning_summary
 from utils.metrics import compute_metrics_segmentation
 from utils.active_learning import (
     sample_initial_data,
@@ -113,9 +113,9 @@ def simulate_vlm_feedback_on_batch(
     # Iterate through batch items for VLM feedback
     for i in range(len(images)):
         original_image = images[i]
-        gt_mask_pil = gt_masks[i].convert('L') # Ensure ground truth is grayscale
+        gt_mask_pil = gt_masks[i].convert('P') # Ensure ground truth is grayscale
         pred_mask_np = predicted_mask_tensor[i].cpu().numpy().astype(np.uint8)
-        pred_mask_pil = Image.fromarray(pred_mask_np, mode='L')
+        pred_mask_pil = Image.fromarray(pred_mask_np, mode='P')
 
         # --- VLM Interaction Logic ---
         # Here, we need to decide WHAT to ask the VLM. The prompt asks for
@@ -130,10 +130,19 @@ def simulate_vlm_feedback_on_batch(
         # Find dominant ground truth label
         gt_mask_np = np.array(gt_mask_pil)
         gt_labels, gt_counts = np.unique(gt_mask_np[gt_mask_np != 0], return_counts=True)
+        logger.info(f"Predicted Labels: {pred_labels}, GT Labels: {gt_labels}, GT Counts: {gt_counts}")
         dominant_gt_label_id = gt_labels[np.argmax(gt_counts)] if len(gt_labels) > 0 else 0
-
+        logger.info(f"Dominant Predicted Label ID: {dominant_pred_label_id}, Dominant GT Label ID: {dominant_gt_label_id}")
         predicted_label_name = PASCAL_VOC_ID2LABEL.get(dominant_pred_label_id, "unknown")
         ground_truth_label_name = PASCAL_VOC_ID2LABEL.get(dominant_gt_label_id, "unknown")
+        logger.info(f"Predicted Label Name: {predicted_label_name}, GT Label Name: {ground_truth_label_name}")
+        # save the iamge for debugging
+        debug_dir = config.get('vlm_itl', {}).get('debug_dir', './vlm_debug')
+        os.makedirs(debug_dir, exist_ok=True)
+        original_image.save(os.path.join(debug_dir, f"original_{i}.png"))
+        gt_mask_pil.save(os.path.join(debug_dir, f"gt_mask_{i}.png"))
+        pred_mask_pil.save(os.path.join(debug_dir, f"pred_mask_{i}.png"))
+        exit(1)
 
         # Get feedback from VLM handler
         feedback = vlm_handler.get_vlm_feedback(
@@ -176,6 +185,7 @@ def run_vlm_itl_pipeline(config_path: str):
     logger.info("Initializing VLM Handler...")
     try:
         vlm_handler = get_vlm_handler(config)
+        vlm_handler._load_model()  # Load the VLM model
         logger.info(f"Using VLM handler: {type(vlm_handler).__name__}")
     except Exception as e:
         logger.error(f"Failed to initialize VLM handler: {e}", exc_info=True)
@@ -289,19 +299,38 @@ def run_vlm_itl_pipeline(config_path: str):
         setup_wandb(iteration_config, run_name=iter_run_name, project_name=config.get('project_name'))
 
         iter_training_args = TrainingArguments(
-            output_dir=iter_output_dir, run_name=iter_run_name,
-            num_train_epochs=config['training']['num_train_epochs'],
-            per_device_train_batch_size=config['training']['per_device_train_batch_size'],
-            per_device_eval_batch_size=config['training']['per_device_eval_batch_size'],
-            learning_rate=config['training']['learning_rate'], weight_decay=config['training']['weight_decay'],
-            evaluation_strategy=config['training']['evaluation_strategy'], save_strategy=config['training']['save_strategy'],
-            save_total_limit=config['training']['save_total_limit'], load_best_model_at_end=config['training']['load_best_model_at_end'],
-            metric_for_best_model=config['training']['metric_for_best_model'],
-            logging_dir=os.path.join(iter_output_dir, 'logs'), logging_steps=config['training']['logging_steps'],
-            remove_unused_columns=config['training'].get('remove_unused_columns', False),
-            fp16=config['training'].get('fp16', False) and torch.cuda.is_available(),
-            seed=config['seed'], report_to=config.get('log_with', 'none').split(','),
-            push_to_hub=False, logging_first_step=True,
+            output_dir=str(iter_output_dir),
+            run_name=str(iter_run_name),
+
+            # ints
+            num_train_epochs=int(config['training']['num_train_epochs']),
+            per_device_train_batch_size=int(config['training']['per_device_train_batch_size']),
+            per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
+            save_total_limit=int(config['training']['save_total_limit']),
+            logging_steps=int(config['training']['logging_steps']),
+            seed=int(config['seed']),
+
+            # floats
+            learning_rate=float(config['training']['learning_rate']),
+            weight_decay=float(config['training']['weight_decay']),
+
+            # strings
+            eval_strategy=str(config['training']['evaluation_strategy']),
+            save_strategy=str(config['training']['save_strategy']),
+            metric_for_best_model=str(config['training']['metric_for_best_model']),
+
+            # booleans
+            load_best_model_at_end=bool(config['training']['load_best_model_at_end']),
+            remove_unused_columns=bool(config['training'].get('remove_unused_columns', False)),
+            fp16=bool(config['training'].get('fp16', False) and torch.cuda.is_available()),
+
+            # logging / reporting
+            logging_dir=os.path.join(iter_output_dir, 'logs'),
+            logging_first_step=True,
+            report_to=[x.strip() for x in str(config.get('log_with', 'none')).split(',') if x.strip()],
+
+            # never push these interim checkpoints
+            push_to_hub=False
         )
         compute_metrics_fn = partial(compute_metrics_segmentation, num_labels=NUM_PASCAL_VOC_LABELS, ignore_index=255)
         al_progress_callback = ActiveLearningProgressCallback(total_al_steps, current_al_step, current_data_percentage)
@@ -373,8 +402,11 @@ def run_vlm_itl_pipeline(config_path: str):
         final_output_dir = os.path.join(output_dir_prefix, "final")
         os.makedirs(final_output_dir, exist_ok=True)
         final_eval_args = TrainingArguments(
-            output_dir=final_output_dir, per_device_eval_batch_size=config['training']['per_device_eval_batch_size'],
-            fp16=config['training'].get('fp16', False) and torch.cuda.is_available(), report_to="none", remove_unused_columns=False,
+            output_dir=final_output_dir, 
+            per_device_eval_batch_size=config['training']['per_device_eval_batch_size'],
+            fp16=config['training'].get('fp16', False) and torch.cuda.is_available(), 
+            report_to="none", 
+            remove_unused_columns=False,
         )
         final_trainer = Trainer(model=current_model, args=final_eval_args, compute_metrics=compute_metrics_fn)
         test_metrics = final_trainer.evaluate(eval_dataset=processed_test_dataset)

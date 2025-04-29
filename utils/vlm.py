@@ -17,7 +17,7 @@ class VLMHandler(ABC):
 
     @abstractmethod
     def _load_model(self):
-        """Loads the underlying VLM (or sets up mock behavior)."""
+        """Loads the underlying VLM."""
         pass
 
     @abstractmethod
@@ -74,7 +74,8 @@ class VLMHandler(ABC):
         vlm_answer = self.ask_binary_question(image, segmentation_mask, query)
 
         is_correct_segmentation = (predicted_label_name == ground_truth_label_name)
-
+        logger.info(f"VLM query: {query}, VLM answer: {vlm_answer}. Predicted label: {predicted_label_name}, GT label: {ground_truth_label_name}.")
+        logger.info(f"Is segmentation correct? {is_correct_segmentation}")
         # Does VLM agree with GT?
         # If seg is correct (pred==GT), VLM should say True.
         # If seg is incorrect (pred!=GT), VLM should say False.
@@ -164,7 +165,7 @@ class MockVLMHandler(VLMHandler):
             else:
                 # VLM gives the incorrect assessment
                 vlm_answer = not is_correct_segmentation
-            vlm_agrees = (vlm_answer == is_correct_segmentation) # Should always be True if random < accuracy
+            vlm_agrees = (vlm_answer == is_correct_segmentation) # Should al1ys be True if random < accuracy
         else:
             # Purely random VLM answer
             vlm_answer = random.choice([True, False])
@@ -177,67 +178,64 @@ class MockVLMHandler(VLMHandler):
             "is_segmentation_correct": is_correct_segmentation, # Reality
         }
 
+class HuggingFaceVLMHandler(VLMHandler):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.pipeline = None
 
-# Example Placeholder for a real VLM (e.g., using transformers pipeline)
-# class HuggingFaceVLMHandler(VLMHandler):
-#     def __init__(self, config: Optional[Dict[str, Any]] = None):
-#         super().__init__(config)
-#         self.pipeline = None
+    def _load_model(self):
+        try:
+            from transformers import pipeline
+            model_name = self.config.get("vlm_model_name", "Salesforce/blip-vqa-base") # Example
+            task = "visual-question-answering"
+            logger.info(f"Loading VLM pipeline: {model_name} for task: {task}")
+            # Note: May need specific device placement (e.g., device=0 for GPU)
+            self.pipeline = pipeline(task, model=model_name)
+            logger.info("VLM pipeline loaded successfully.")
+        except ImportError:
+            logger.error("transformers library not installed or failed to import pipeline. Install with `pip install transformers`")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to load VLM pipeline model '{model_name}': {e}", exc_info=True)
+            raise
 
-#     def _load_model(self):
-#         try:
-#             from transformers import pipeline
-#             model_name = self.config.get("vlm_model_name", "Salesforce/blip-vqa-base") # Example
-#             task = "visual-question-answering"
-#             logger.info(f"Loading VLM pipeline: {model_name} for task: {task}")
-#             # Note: May need specific device placement (e.g., device=0 for GPU)
-#             self.pipeline = pipeline(task, model=model_name)
-#             logger.info("VLM pipeline loaded successfully.")
-#         except ImportError:
-#             logger.error("transformers library not installed or failed to import pipeline. Install with `pip install transformers`")
-#             raise
-#         except Exception as e:
-#             logger.error(f"Failed to load VLM pipeline model '{model_name}': {e}", exc_info=True)
-#             raise
+    def ask_binary_question(
+        self,
+        image: Image.Image,
+        segmentation_mask: Optional[Image.Image], # VQA pipelines might not use the mask directly
+        prompt: str
+    ) -> bool:
+        if self.pipeline is None:
+             logger.error("VLM pipeline not initialized.")
+             raise RuntimeError("VLM pipeline not available.")
 
-#     def ask_binary_question(
-#         self,
-#         image: Image.Image,
-#         segmentation_mask: Optional[Image.Image], # VQA pipelines might not use the mask directly
-#         prompt: str
-#     ) -> bool:
-#         if self.pipeline is None:
-#              logger.error("VLM pipeline not initialized.")
-#              raise RuntimeError("VLM pipeline not available.")
+        try:
+            # Ensure prompt clearly asks a yes/no question
+            if not prompt.lower().strip().startswith(("is ", "are ", "does ", "do ", "can ", "will ")):
+                 logger.warning(f"VLM prompt '{prompt}' might not be a clear yes/no question.")
 
-#         try:
-#             # Ensure prompt clearly asks a yes/no question
-#             if not prompt.lower().strip().startswith(("is ", "are ", "does ", "do ", "can ", "will ")):
-#                  logger.warning(f"VLM prompt '{prompt}' might not be a clear yes/no question.")
+            # Combine image and prompt for VQA pipeline
+            # The pipeline might require specific input formats
+            result = self.pipeline(image, prompt, top_k=1) # Get the top answer
 
-#             # Combine image and prompt for VQA pipeline
-#             # The pipeline might require specific input formats
-#             result = self.pipeline(image, prompt, top_k=1) # Get the top answer
+            # Process the result to get a boolean answer
+            answer_text = result[0]['answer'].lower().strip()
+            logger.debug(f"VLM raw answer for '{prompt}': {answer_text}")
 
-#             # Process the result to get a boolean answer
-#             answer_text = result[0]['answer'].lower().strip()
-#             logger.debug(f"VLM raw answer for '{prompt}': {answer_text}")
+            # Simple yes/no parsing (can be improved)
+            if answer_text.startswith("yes"):
+                return True
+            elif answer_text.startswith("no"):
+                return False
+            else:
+                # Ambiguous answer, default to False or raise an error?
+                logger.warning(f"VLM answer '{answer_text}' is ambiguous for binary question. Defaulting to False.")
+                return False
 
-#             # Simple yes/no parsing (can be improved)
-#             if answer_text.startswith("yes"):
-#                 return True
-#             elif answer_text.startswith("no"):
-#                 return False
-#             else:
-#                 # Ambiguous answer, default to False or raise an error?
-#                 logger.warning(f"VLM answer '{answer_text}' is ambiguous for binary question. Defaulting to False.")
-#                 return False
-
-#         except Exception as e:
-#             logger.error(f"Error during VLM inference: {e}", exc_info=True)
-#             # Fallback strategy: return False or raise?
-#             return False
-
+        except Exception as e:
+            logger.error(f"Error during VLM inference: {e}", exc_info=True)
+            # Fallback strategy: return False or raise?
+            return False
 
 def get_vlm_handler(config: Dict[str, Any]) -> VLMHandler:
     """Factory function to get the appropriate VLM handler based on config."""
@@ -247,12 +245,11 @@ def get_vlm_handler(config: Dict[str, Any]) -> VLMHandler:
     if vlm_type == "mock":
         logger.info("Creating MockVLMHandler.")
         return MockVLMHandler(vlm_options)
-    # elif vlm_type == "huggingface_blip": # Example for future extension
-    #     logger.info("Creating HuggingFaceVLMHandler (BLIP).")
-    #     # Ensure necessary options like model name are passed if needed
-    #     vlm_options["vlm_model_name"] = vlm_options.get("vlm_model_name", "Salesforce/blip-vqa-base")
-    #     return HuggingFaceVLMHandler(vlm_options)
-    # Add more VLM types here as needed
+    elif vlm_type == "huggingface_blip": # Example for future extension
+        logger.info("Creating HuggingFaceVLMHandler (BLIP).")
+        # Ensure necessary options like model name are passed if needed
+        vlm_options["vlm_model_name"] = vlm_options.get("vlm_model_name", "Salesforce/blip-vqa-base")
+        return HuggingFaceVLMHandler(vlm_options)
     else:
         raise ValueError(f"Unsupported VLM handler type: {vlm_type}")
 
@@ -291,7 +288,7 @@ if __name__ == '__main__':
 
     # Count how often the VLM agrees with reality over N trials
     agree_count = 0
-    n_trials = 100
+    n_trials = 1000
     print(f"\nSimulating {n_trials} feedback calls to check mock accuracy...")
     for _ in range(n_trials):
         # Randomly choose if the segmentation was correct or not for this trial
@@ -306,11 +303,11 @@ if __name__ == '__main__':
     print(f"Simulated VLM agreement accuracy: {simulated_accuracy:.3f} (Expected ~{mock_handler_biased.config.get('mock_accuracy', 0.5):.3f})")
     assert abs(simulated_accuracy - mock_handler_biased.config.get('mock_accuracy', 0.5)) < 0.15 # Allow some statistical noise
 
-    # Example of trying to create a real handler (will fail if transformers not installed)
-    # print("\nTesting HuggingFaceVLMHandler (requires transformers)...")
-    # try:
-    #     hf_config = {'vlm_itl': {'vlm_handler': 'huggingface_blip'}}
-    #     hf_handler = get_vlm_handler(hf_config)
-    #     print(f"HF VLM answer to '{prompt1}': {hf_handler.ask_binary_question(dummy_img, None, prompt1)}")
-    # except Exception as e:
-    #     print(f"Failed to create or use HuggingFaceVLMHandler: {e}")
+    print("\nTesting HuggingFaceVLMHandler...")
+    try:
+        hf_config = {'vlm_itl': {'vlm_handler': 'huggingface_blip'}}
+        hf_handler = get_vlm_handler(hf_config)
+        hf_handler._load_model()  # Load the model
+        print(f"HF VLM answer to '{prompt1}': {hf_handler.ask_binary_question(dummy_img, None, prompt1)}")
+    except Exception as e:
+        print(f"Failed to create or use HuggingFaceVLMHandler: {e}")

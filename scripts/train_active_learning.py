@@ -24,7 +24,7 @@ from transformers import (
 from datasets import Dataset, DatasetDict, concatenate_datasets
 
 from utils.config import load_config
-from utils.logging import setup_wandb, logger, log_active_learning_summary
+from utils.log_utils import setup_wandb, logger, log_active_learning_summary
 from utils.metrics import compute_metrics_segmentation
 from utils.active_learning import sample_initial_data, select_next_batch_indices, ActiveLearningProgressCallback
 from data.pascal_voc import (
