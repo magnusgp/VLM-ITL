@@ -24,13 +24,14 @@ from transformers import (
 from datasets import Dataset, DatasetDict, concatenate_datasets
 
 from utils.config import load_config
-from utils.log_utils import setup_wandb, logger, log_active_learning_summary
+from utils.log_utils import setup_wandb, logger, log_active_learning_summary, debug_log_and_plot
 from utils.metrics import compute_metrics_segmentation
 from utils.active_learning import sample_initial_data, select_next_batch_indices, ActiveLearningProgressCallback, SegmentationImageLoggerCallback
 from data.pascal_voc import (
     load_pascal_voc_dataset,
     preprocess_data,
     create_train_val_test_splits, # Use this for consistent val/test sets
+    PASCAL_VOC_LABEL_NAMES,
     PASCAL_VOC_ID2LABEL,
     PASCAL_VOC_LABEL2ID,
     NUM_PASCAL_VOC_LABELS
@@ -167,7 +168,11 @@ def run_active_learning_pipeline(config_path: str):
         current_train_subset_raw = full_train_data.select(current_indices)
         logger.info(f"Preprocessing training subset ({len(current_train_subset_raw)} samples)...")
         current_train_subset_processed = current_train_subset_raw.map(
-            preprocess_fn, batched=True, remove_columns=current_train_subset_raw.column_names
+            preprocess_fn, 
+            batched=True, 
+            remove_columns=current_train_subset_raw.column_names,
+            batch_size=config['training'].get('per_device_train_batch_size', 8), # Use train batch size for preprocessing
+            load_from_cache_file=False # Force reprocessing to avoid cache issues
         )
         current_train_subset_processed.set_format("torch")
         logger.info("Training subset preprocessing complete.")
@@ -276,6 +281,15 @@ def run_active_learning_pipeline(config_path: str):
         image_logger_callback.trainer = trainer # Set trainer for the callback
         image_logger_callback.train_dataset = current_train_subset_processed # Set train dataset for logging
         image_logger_callback.eval_dataset = processed_val_dataset # Set eval dataset for logging
+        
+        if config.get('debug', False):
+            logger.info("Debugging mode enabled. Logging a batch of data.")
+            # Log a batch of data
+            train_loader = trainer.get_train_dataloader()
+            batch = next(iter(train_loader))
+            imgs = batch["pixel_values"]   # tensor [B,3,H,W]
+            msks = batch["labels"]         # tensor [B,H,W]
+            debug_log_and_plot(imgs, msks, PASCAL_VOC_LABEL_NAMES)
 
         # --- 6c. Train Model for Current Iteration ---
         logger.info(f"Starting training for {target_percentage_int}% data...")
@@ -287,7 +301,7 @@ def run_active_learning_pipeline(config_path: str):
              logger.info(f"Training finished for {target_percentage_int}% data.")
         except Exception as e:
              logger.error(f"Training failed at iteration {current_al_step} ({target_percentage_int}%): {e}", exc_info=True)
-             # Decide whether to continue or stop the loop
+             # TODO: Decide whether to continue or stop the loop
              break # Stop the loop on training failure
 
         # --- 6d. Evaluate and Log Metrics for Current Iteration ---
@@ -310,7 +324,6 @@ def run_active_learning_pipeline(config_path: str):
              # Log the eval metrics explicitly to the *current* run before finishing
              wandb.log({f"final_eval_{k}": v for k, v in eval_metrics.items()})
              wandb.finish() # Finish the per-iteration run
-
 
     # --- 7. Final Evaluation on Test Set (using the model from the last iteration) ---
     if current_model and processed_test_dataset:

@@ -2,6 +2,14 @@ import wandb
 import os
 from typing import Dict, Any, Optional
 import logging
+import matplotlib.pyplot as plt
+import sys
+import torch
+import numpy as np
+
+from data.pascal_voc import (PASCAL_VOC_IGNORE_INDEX)
+# Ensure matplotlib is in non-interactive mode
+plt.switch_backend('Agg')  # Use 'Agg' backend for non-interactive plotting
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,9 +44,7 @@ def setup_wandb(config: Dict[str, Any], run_name: str, project_name: Optional[st
                 name=run_name,
                 config=config, # Log the entire config
                 reinit=True, # Allow re-initialization in loops (like active learning),
-                # turn off logging to wandb for this run
                 mode=os.getenv("WANDB_MODE", "online") # Use online or offline mode based on environment variable
-                # mode="offline"
             )
             logger.info(f"Wandb initialized successfully. Run page: {run.url}")
             return run
@@ -102,6 +108,60 @@ def log_active_learning_summary(overall_metrics: Dict[int, Dict[str, float]], co
             logger.error(f"Failed to log active learning summary to wandb: {e}", exc_info=True)
     else:
         logger.info("Wandb not enabled or not initialized. Skipping active learning summary logging.")
+        
+def debug_log_and_plot(images: torch.Tensor,
+                       masks:  torch.Tensor,
+                       class_names: list[str],
+                       out_path:  str = "debug_segmentation.png") -> None:
+    """Helper function to log and plot images and masks for debugging.
+
+    Args:
+        images (torch.Tensor): _images_ tensor of shape [B, C, H, W].
+        masks (torch.Tensor): _masks_ tensor of shape [B, H, W].
+        class_names (list[str]): _class_names_ list of class names.
+        out_path (str, optional): _out_path_ path to save the debug image. Defaults to "debug_segmentation.png".
+    Returns:
+        None
+    """
+    logger.info("Debugging: Logging and plotting images and masks.")
+    if images.dim() != 4 or masks.dim() != 3:
+        logger.error("Invalid dimensions for images or masks.")
+        raise ValueError("Images must be 4D [B, C, H, W] and masks must be 3D [B, H, W].")
+    num_images = images.shape[0]
+    if num_images > 4:
+        logger.warning("More than 4 images provided. Only the first 4 will be plotted.")
+        num_images = 4
+    fig, axes = plt.subplots(num_images, 3, figsize=(10, num_images * 5))
+    for i in range(num_images):
+        # Plot image
+        img = images[i].permute(1, 2, 0).cpu().numpy()
+        img = (img - img.min()) / (img.max() - img.min())  # Normalize to [0, 1]
+        axes[i, 0].imshow(img)
+        axes[i, 0].axis('off')
+        axes[i, 0].set_title(f"Image {i + 1}")
+        # Write label
+        label = masks[i].cpu().numpy()
+        label = np.unique(label)
+        label = [class_names[l] for l in label if l != PASCAL_VOC_IGNORE_INDEX]
+        axes[i, 1].imshow(img)
+        axes[i, 1].axis('off')
+        axes[i, 1].set_title(f"Label {i + 1}: {', '.join(label)}")
+        # Plot mask
+        mask = masks[i].cpu().numpy()
+        axes[i, 2].imshow(mask, cmap='jet', alpha=0.5)
+        axes[i, 2].axis('off')
+        axes[i, 2].set_title(f"Mask {i + 1}")
+        # Add color legend
+        for j, class_name in enumerate(class_names):
+            axes[i, 2].add_patch(plt.Rectangle((0, 0), 1, 1, color=plt.cm.jet(j / len(class_names)), label=class_name))
+        axes[i, 2].legend(loc='upper right', bbox_to_anchor=(1.2, 1), fontsize='small')
+    # Save figure
+    plt.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    logger.info(f"\tWrote debug figure to {out_path}\n")
+    sys.exit(1)  # Exit after saving the figure
+    return None
 
 if __name__ == '__main__':
     # Example Usage

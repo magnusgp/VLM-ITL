@@ -211,8 +211,20 @@ def run_vlm_itl_pipeline(config_path: str):
         image_col=config['dataset']['image_col'], mask_col=config['dataset']['mask_col']
     )
     logger.info("Preprocessing fixed validation and test sets...")
-    processed_val_dataset = val_dataset.map(preprocess_fn, batched=True, remove_columns=val_dataset.column_names)
-    processed_test_dataset = test_dataset.map(preprocess_fn, batched=True, remove_columns=test_dataset.column_names)
+    processed_val_dataset = val_dataset.map(
+        preprocess_fn, 
+        batched=True, 
+        remove_columns=val_dataset.column_names,
+        batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
+        load_from_cache_file=False # Force reprocessing to avoid cache issues
+        )
+    processed_test_dataset = test_dataset.map(
+        preprocess_fn, 
+        batched=True, 
+        remove_columns=test_dataset.column_names,
+        batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
+        load_from_cache_file=False # Force reprocessing to avoid cache issues)
+    )
     processed_val_dataset.set_format("torch")
     processed_test_dataset.set_format("torch")
 
@@ -267,7 +279,11 @@ def run_vlm_itl_pipeline(config_path: str):
         current_train_subset_raw = full_train_data.select(current_indices)
         logger.info(f"Preprocessing training subset ({len(current_train_subset_raw)} samples)...")
         current_train_subset_processed = current_train_subset_raw.map(
-            preprocess_fn, batched=True, remove_columns=current_train_subset_raw.column_names
+            preprocess_fn, 
+            batched=True, 
+            remove_columns=current_train_subset_raw.column_names,
+            batch_size=config['training'].get('per_device_train_batch_size', 8), # Use train batch size for preprocessing
+            load_from_cache_file=False # Force reprocessing to avoid cache issues
         )
         current_train_subset_processed.set_format("torch")
 
