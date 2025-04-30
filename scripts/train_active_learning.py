@@ -26,7 +26,7 @@ from datasets import Dataset, DatasetDict, concatenate_datasets
 from utils.config import load_config
 from utils.log_utils import setup_wandb, logger, log_active_learning_summary
 from utils.metrics import compute_metrics_segmentation
-from utils.active_learning import sample_initial_data, select_next_batch_indices, ActiveLearningProgressCallback
+from utils.active_learning import sample_initial_data, select_next_batch_indices, ActiveLearningProgressCallback, SegmentationImageLoggerCallback
 from data.pascal_voc import (
     load_pascal_voc_dataset,
     preprocess_data,
@@ -90,10 +90,18 @@ def run_active_learning_pipeline(config_path: str):
     # Preprocess the FIXED validation and test sets ONCE
     logger.info("Preprocessing fixed validation and test sets...")
     processed_val_dataset = val_dataset.map(
-        preprocess_fn, batched=True, remove_columns=val_dataset.column_names
+        preprocess_fn, 
+        batched=True, 
+        remove_columns=val_dataset.column_names,
+        batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
+        load_from_cache_file=False # Force reprocessing to avoid cache issues
     )
     processed_test_dataset = test_dataset.map(
-        preprocess_fn, batched=True, remove_columns=test_dataset.column_names
+        preprocess_fn, 
+        batched=True, 
+        remove_columns=test_dataset.column_names,
+        batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
+        load_from_cache_file=False # Force reprocessing to avoid cache issues
     )
     processed_val_dataset.set_format("torch")
     processed_test_dataset.set_format("torch")
@@ -236,11 +244,17 @@ def run_active_learning_pipeline(config_path: str):
             ignore_index=255
         )
 
-        # Add AL progress callback
+        # AL callbacks
         al_progress_callback = ActiveLearningProgressCallback(
             total_al_steps=total_al_steps,
             current_al_step=current_al_step,
             current_data_percentage=current_data_percentage
+        )
+        image_logger_callback = SegmentationImageLoggerCallback(
+            processor=image_processor,
+            id2label=PASCAL_VOC_ID2LABEL,
+            num_samples=3,
+            log_train=True
         )
         # Optional: Add Early Stopping per iteration
         early_stopping_callback = EarlyStoppingCallback(
@@ -255,9 +269,13 @@ def run_active_learning_pipeline(config_path: str):
             train_dataset=current_train_subset_processed,
             eval_dataset=processed_val_dataset, # Use the FIXED validation set
             compute_metrics=compute_metrics_fn,
-            callbacks=[al_progress_callback, early_stopping_callback] # Add callbacks
+            callbacks=[al_progress_callback, early_stopping_callback, image_logger_callback] # Add callbacks
             # No need to pass model_init if we reuse the model object
         )
+        
+        image_logger_callback.trainer = trainer # Set trainer for the callback
+        image_logger_callback.train_dataset = current_train_subset_processed # Set train dataset for logging
+        image_logger_callback.eval_dataset = processed_val_dataset # Set eval dataset for logging
 
         # --- 6c. Train Model for Current Iteration ---
         logger.info(f"Starting training for {target_percentage_int}% data...")
@@ -321,7 +339,7 @@ def run_active_learning_pipeline(config_path: str):
 
         # Save final model and test metrics
         final_trainer.save_model(os.path.join(final_output_dir, "final_model"))
-        final_trainer.save_metrics("eval", test_metrics, metric_key_prefix="test") # Saves to final_output_dir/test_results.json
+        final_trainer.save_metrics("eval", test_metrics) # Saves to final_output_dir/test_results.json
         logger.info(f"Final model saved to {os.path.join(final_output_dir, 'final_model')}")
 
         # Log final test metrics to a summary W&B run (optional)

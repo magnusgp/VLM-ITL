@@ -8,6 +8,8 @@ from functools import partial
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from transformers import (
     TrainingArguments,
@@ -24,6 +26,7 @@ from data.pascal_voc import (
     load_pascal_voc_dataset,
     preprocess_data,
     create_train_val_test_splits,
+    PASCAL_VOC_LABEL_NAMES,
     PASCAL_VOC_ID2LABEL,
     PASCAL_VOC_LABEL2ID,
     NUM_PASCAL_VOC_LABELS,
@@ -31,6 +34,59 @@ from data.pascal_voc import (
 )
 from models.segformer import load_model_for_segmentation
 
+def debug_log_and_plot(images: torch.Tensor,
+                       masks:  torch.Tensor,
+                       class_names: list[str],
+                       out_path:  str = "debug_segmentation.png") -> None:
+    """Helper function to log and plot images and masks for debugging.
+
+    Args:
+        images (torch.Tensor): _images_ tensor of shape [B, C, H, W].
+        masks (torch.Tensor): _masks_ tensor of shape [B, H, W].
+        class_names (list[str]): _class_names_ list of class names.
+        out_path (str, optional): _out_path_ path to save the debug image. Defaults to "debug_segmentation.png".
+    Returns:
+        None
+    """
+    logger.info("Debugging: Logging and plotting images and masks.")
+    if images.dim() != 4 or masks.dim() != 3:
+        logger.error("Invalid dimensions for images or masks.")
+        raise ValueError("Images must be 4D [B, C, H, W] and masks must be 3D [B, H, W].")
+    num_images = images.shape[0]
+    if num_images > 4:
+        logger.warning("More than 4 images provided. Only the first 4 will be plotted.")
+        num_images = 4
+    fig, axes = plt.subplots(num_images, 3, figsize=(10, num_images * 5))
+    for i in range(num_images):
+        # Plot image
+        img = images[i].permute(1, 2, 0).cpu().numpy()
+        img = (img - img.min()) / (img.max() - img.min())  # Normalize to [0, 1]
+        axes[i, 0].imshow(img)
+        axes[i, 0].axis('off')
+        axes[i, 0].set_title(f"Image {i + 1}")
+        # Write label
+        label = masks[i].cpu().numpy()
+        label = np.unique(label)
+        label = [class_names[l] for l in label if l != PASCAL_VOC_IGNORE_INDEX]
+        axes[i, 1].imshow(img)
+        axes[i, 1].axis('off')
+        axes[i, 1].set_title(f"Label {i + 1}: {', '.join(label)}")
+        # Plot mask
+        mask = masks[i].cpu().numpy()
+        axes[i, 2].imshow(mask, cmap='jet', alpha=0.5)
+        axes[i, 2].axis('off')
+        axes[i, 2].set_title(f"Mask {i + 1}")
+        # Add color legend
+        for j, class_name in enumerate(class_names):
+            axes[i, 2].add_patch(plt.Rectangle((0, 0), 1, 1, color=plt.cm.jet(j / len(class_names)), label=class_name))
+        axes[i, 2].legend(loc='upper right', bbox_to_anchor=(1.2, 1), fontsize='small')
+    # Save figure
+    plt.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    logger.info(f"\tWrote debug figure to {out_path}\n")
+    sys.exit(1)  # Exit after saving the figure
+    return None
 
 class SegmentationTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -38,9 +94,6 @@ class SegmentationTrainer(Trainer):
         How the loss is computed by Trainer. By default, all models return a tuple checking if labels were provided or not.
         We override this to explicitly pass labels AND retrieve the loss.
         """
-        # logger.info("Inputs to compute_loss: %s", inputs)
-        # logger.info(f"Inputs keys: {inputs.keys()}")
-
         # Extract labels so we can pass them in the forward pass
         labels = inputs.pop("labels", None)
         pixel_values = inputs.get("pixel_values")
@@ -51,7 +104,6 @@ class SegmentationTrainer(Trainer):
         if pixel_values is None:
             logger.warning("No pixel values provided in inputs. Loss cannot be computed.")
             raise ValueError("Both 'pixel_values' and 'labels' must be in inputs to compute loss.")
-        # --- START FIX ---
         # Ensure labels are 3D: [batch_size, height, width]
         # The cross_entropy loss expects targets without the channel dimension
         if labels.dim() == 4 and labels.shape[1] == 1:
@@ -62,7 +114,6 @@ class SegmentationTrainer(Trainer):
              # Add a check for other unexpected shapes
              logger.error(f"Unexpected labels tensor shape: {labels.shape}. Expected 3D [B, H, W] or 4D [B, 1, H, W].")
              raise ValueError(f"Unexpected labels tensor shape: {labels.shape}")
-        # --- END FIX ---
         # Forward pass with explicit labels
         outputs = model(pixel_values=pixel_values, labels=labels)
 
@@ -147,24 +198,42 @@ def main(config_path: str):
         image_col=config['dataset']['image_col'],
         mask_col=config['dataset']['mask_col']
     )
+    if config.get('debug', False):
 
-    # Log some sample shapes before mapping
-    sample_examples = prepared_datasets["train"].select(range(2))
-    for example in sample_examples:
-        processed = preprocess_data(
-            example,
-            image_processor=image_processor,
-            image_col=config['dataset']['image_col'],
-            mask_col=config['dataset']['mask_col']
-        )
-        logger.info(f"Sample processed pixel_values shape: {processed['pixel_values'].shape}")
-        logger.info(f"Sample processed labels shape: {processed['labels'].shape}")
+        # Log some sample shapes before mapping
+        sample_examples = prepared_datasets["train"].select(range(3))
+        for i, example in enumerate(sample_examples):
+            processed = preprocess_data(
+                example,
+                image_processor=image_processor,
+                image_col=config['dataset']['image_col'],
+                mask_col=config['dataset']['mask_col']
+            )
+            processed['pixel_values'] = processed['pixel_values'][0]
+            processed['labels'] = processed['labels'][0]
+            logger.info(f"Sample processed pixel_values shape: {processed['pixel_values'].shape}")
+            logger.info(f"Sample processed labels shape: {processed['labels'].shape}")
+            uniq = np.unique(processed['labels'])
+            # apply id2label to get the label names
+            label_names = [PASCAL_VOC_ID2LABEL[i] for i in uniq if i in PASCAL_VOC_ID2LABEL]
+            logger.info(f"Sample processed labels unique values: {uniq}")
+            logger.info(f"Sample processed labels unique names: {label_names}")
+            logger.info("Debugging mode enabled. Saving processed example.")
+            logger.info(f"Image {i}:")
+            logger.info(f"Processed image shape: {processed['pixel_values'].shape}")
+            processed_image = processed['pixel_values'].permute(1, 2, 0).numpy()
+            processed_image = (processed_image - processed_image.min()) / (processed_image.max() - processed_image.min())
+            plt.imsave(
+                os.path.join(config['output_dir'], f"sample_{i}_image.png"),
+                processed_image
+            )
+            # sys.exit(1)
 
     processed_datasets = prepared_datasets.map(
         preprocess_fn,
         batched=True,
         batch_size=config['training']['per_device_train_batch_size'],
-        load_from_cache_file=config['dataset'].get('load_from_cache_file', True),
+        load_from_cache_file=config['dataset'].get('load_from_cache_file', False),
     )
     processed_datasets.set_format("torch", columns=["pixel_values", "labels"])
     logger.info("Preprocessing complete.")
@@ -251,6 +320,15 @@ def main(config_path: str):
         eval_dataset=processed_datasets.get("validation"),
         compute_metrics=compute_metrics_fn
     )
+    
+    if config.get('debug', False):
+        logger.info("Debugging mode enabled. Logging a batch of data.")
+        # Log a batch of data
+        train_loader = trainer.get_train_dataloader()
+        batch = next(iter(train_loader))
+        imgs = batch["pixel_values"]   # tensor [B,3,H,W]
+        msks = batch["labels"]         # tensor [B,H,W]
+        debug_log_and_plot(imgs, msks, PASCAL_VOC_LABEL_NAMES)
 
     # --- 8. Train ---
     logger.info("Starting training...")

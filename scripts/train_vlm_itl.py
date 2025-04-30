@@ -83,9 +83,10 @@ def simulate_vlm_feedback_on_batch(
     )
     # Need to handle single items if batch size is 1, map works on lists
     processed_inputs = preprocess_fn({'image': images, 'mask': gt_masks})
-
-    pixel_values = processed_inputs['pixel_values'].to(device)
-    # 'labels' from processed_inputs are preprocessed GT, not needed for prediction here
+    pixel_values = []
+    for i in range(len(processed_inputs['pixel_values'])):
+        pixel_values.append(processed_inputs['pixel_values'][i].unsqueeze(0).to(device))
+    pixel_values = torch.cat(pixel_values, dim=0) # Shape: (batch, 3, H, W)
 
     model.eval() # Set model to evaluation mode
     with torch.no_grad():
@@ -113,13 +114,12 @@ def simulate_vlm_feedback_on_batch(
     # Iterate through batch items for VLM feedback
     for i in range(len(images)):
         original_image = images[i]
+        gt_mask_np = processed_inputs["labels"][i].cpu().numpy().astype(np.uint8)
         gt_mask_pil = gt_masks[i]
         
         pred_mask_np = predicted_mask_tensor[i].cpu().numpy().astype(np.uint8)
         pred_mask_pil = Image.fromarray(pred_mask_np, mode='L')
         
-        gt_mask_np = processed_inputs["labels"][i].cpu().numpy().astype(np.uint8)
-
         # Find dominant predicted label (excluding background=0 and ignore=255)
         valid_pred = (pred_mask_np != 255) & (pred_mask_np != 0)
         pred_labels, pred_counts = np.unique(
@@ -406,7 +406,7 @@ def run_vlm_itl_pipeline(config_path: str):
         test_metrics = final_trainer.evaluate(eval_dataset=processed_test_dataset)
         logger.info(f"Final Test Set Metrics: {test_metrics}")
         final_trainer.save_model(os.path.join(final_output_dir, "final_model"))
-        final_trainer.save_metrics("eval", test_metrics, metric_key_prefix="test")
+        final_trainer.save_metrics("eval", test_metrics)
         logger.info(f"Final model saved to {os.path.join(final_output_dir, 'final_model')}")
 
         # --- 8. Log Final Summary (including VLM info) ---

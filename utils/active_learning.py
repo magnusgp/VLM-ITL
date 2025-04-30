@@ -1,15 +1,19 @@
-import numpy as np
-from datasets import Dataset, concatenate_datasets
-from typing import List, Tuple, Dict, Optional, Callable, Any
 import random
 import math
 import logging
-import os
+from typing import List, Tuple, Dict, Optional, Callable, Any
 
+import torch
+import numpy as np
+import wandb
+from torch.utils.data import DataLoader
+from sklearn.metrics import pairwise_distances
+from datasets import Dataset, concatenate_datasets
 from transformers import Trainer, TrainingArguments, TrainerCallback, TrainerState, TrainerControl
+from PIL import Image
+
 from .vlm import VLMHandler # Import VLM handler
 from .log_utils import log_active_learning_summary # Import summary logger
-import wandb
 
 
 logger = logging.getLogger(__name__)
@@ -52,48 +56,153 @@ def sample_initial_data(
     logger.info(f"Initial dataset created with {len(sampled_dataset)} samples.")
     return sampled_dataset, initial_indices
 
+def build_pool(dataset, indices, preprocess_fn, batch_size):
+    """
+    Constructs a DataLoader over the given indices after preprocessing.
+    """
+    pool = dataset.select(indices)
+    pool = pool.add_column("__orig_idx__", indices)
+    pool_proc = pool.map(preprocess_fn, batched=True)
+    pool_proc.set_format("torch")
+    loader = DataLoader(pool_proc, batch_size=batch_size)
+    return pool, loader
+
+
+def compute_lc_uncertainty(model, loader, pool, device):
+    """
+    Computes pixel-averaged least-confidence scores.
+    """
+    model.to(device).eval()
+    max_probs = []
+    orig_idxs = []
+
+    with torch.no_grad():
+        for batch in loader:
+            inputs = {k: v.to(device) for k, v in batch.items()
+                      if k not in pool.column_names + ["__orig_idx__"]}
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=1)
+            if probs.ndim == 4:  # segmentation
+                m, _ = probs.max(dim=1)          # [B,H,W]
+                m = m.view(m.size(0), -1).mean(dim=1)
+            else:
+                m, _ = probs.max(dim=1)
+            max_probs.append(m.cpu())
+            orig_idxs.extend(batch["__orig_idx__"])
+
+    maxp = torch.cat(max_probs).numpy()
+    uncertainties = 1.0 - maxp
+    return np.array(orig_idxs), uncertainties
+
+
+def compute_bald_uncertainty(model, loader, pool, device, mc_iterations):
+    """
+    Computes BALD scores via MC-dropout.
+    """
+    model.to(device).train()  # enable dropout
+    all_probs = []
+    for _ in range(mc_iterations):
+        iter_probs = []
+        for batch in loader:
+            inputs = {k: v.to(device) for k, v in batch.items()
+                      if k not in pool.column_names + ["__orig_idx__"]}
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=1)
+            if probs.ndim == 4:
+                probs = probs.permute(0,2,3,1).reshape(-1, probs.size(1))
+            iter_probs.append(probs.cpu())
+        all_probs.append(torch.cat(iter_probs, dim=0))
+
+    all_probs = torch.stack(all_probs, dim=0)  # [T, M, C]
+    p_bar = all_probs.mean(dim=0)
+    H_bar = -(p_bar * torch.log(p_bar + 1e-12)).sum(dim=1)
+    H_each = -(all_probs * torch.log(all_probs + 1e-12)).sum(dim=2)
+    H_exp = H_each.mean(dim=0)
+    mi = (H_bar - H_exp).numpy()
+
+    N = len(pool)
+    P = mi.shape[0] // N
+    uncertainties = mi.reshape(N, P).mean(axis=1)
+    return np.array(pool["__orig_idx__"]), uncertainties
+
+
+def extract_features(model, dataset, indices, preprocess_fn, feature_extractor_fn, batch_size, device):
+    """
+    Extracts embedding vectors for given indices.
+    """
+    subpool = dataset.select(indices)
+    subpool_proc = subpool.map(preprocess_fn, batched=True)
+    subpool_proc.set_format("torch")
+    loader = DataLoader(subpool_proc, batch_size=batch_size)
+    feats = []
+    for batch in loader:
+        inputs = {k: v.to(device) for k, v in batch.items()
+                  if k not in subpool.column_names}
+        out = feature_extractor_fn(model, inputs)
+        if out.ndim == 4:
+            out = out.mean(dim=[2,3])
+        feats.append(out.cpu().numpy())
+    return np.vstack(feats)
+
+
+def k_center_greedy(feats, select_count):
+    """
+    Core-set k-Center Greedy selection from feature matrix.
+    """
+    N = feats.shape[0]
+    centers = [0]
+    if select_count > 1:
+        dists = pairwise_distances(feats, feats)
+        for _ in range(1, select_count):
+            dist_to_centers = dists[:, centers].min(axis=1)
+            centers.append(int(np.argmax(dist_to_centers)))
+    return centers
+
 
 def select_next_batch_indices(
-    available_indices: List[int],
-    num_to_select: int,
-    strategy: str = "random",
-    # Add more args here for other strategies (e.g., model, predictions)
-) -> List[int]:
+    available_indices,
+    num_to_select,
+    strategy="random",
+    model=None,
+    dataset=None,
+    preprocess_fn=None,
+    feature_extractor_fn=None,
+    batch_size=4,
+    device="cuda",
+    mc_iterations=5,
+    diversify_pool_factor=10,
+):
     """
-    Selects the indices for the next batch of data to add to the training set.
-
-    Args:
-        available_indices (List[int]): Indices of data points not yet in the training set.
-        num_to_select (int): The number of new data points to select.
-        strategy (str): The sampling strategy ('random', 'uncertainty', etc.).
-                        Currently only 'random' is implemented.
-
-    Returns:
-        List[int]: A list of selected indices.
+    Chooses next batch using 'random', 'lc', or 'bald_diversity'.
     """
+    logger.info(f"Selecting {num_to_select} indices using strategy: {strategy}")
     num_available = len(available_indices)
-    num_to_select = min(num_to_select, num_available) # Cannot select more than available
-
+    num_to_select = min(num_to_select, num_available)
     if num_to_select <= 0:
         return []
 
-    logger.info(f"Selecting next batch of {num_to_select} indices using '{strategy}' strategy from {num_available} available.")
-
     if strategy == "random":
-        # No need to shuffle available_indices again if it was shuffled initially
-        # Just take the next slice. If available_indices is not shuffled, shuffle here.
-        # Assuming available_indices is the *remaining* part of the initially shuffled list.
-        selected_indices = available_indices[:num_to_select]
-    # elif strategy == "uncertainty":
-    #     # Placeholder for uncertainty sampling
-    #     logger.warning("Uncertainty sampling not yet implemented. Using random.")
-    #     selected_indices = random.sample(available_indices, num_to_select)
-    else:
-        raise ValueError(f"Unknown active learning strategy: {strategy}")
+        return available_indices[:num_to_select]
 
-    logger.info(f"Selected {len(selected_indices)} indices for the next batch.")
-    return selected_indices
+    pool, loader = build_pool(dataset, available_indices, preprocess_fn, batch_size)
 
+    if strategy == "lc":
+        orig_idxs, uncs = compute_lc_uncertainty(model, loader, pool, device)
+        order = np.argsort(-uncs)
+        return orig_idxs[order][:num_to_select].tolist()
+
+    if strategy == "bald_diversity":
+        orig_idxs, uncs = compute_bald_uncertainty(model, loader, pool, device, mc_iterations)
+        order = np.argsort(-uncs)
+        ranked = orig_idxs[order]
+        K = min(diversify_pool_factor * num_to_select, num_available)
+        topK = ranked[:K]
+        feats = extract_features(model, dataset, topK, preprocess_fn,
+                                 feature_extractor_fn, batch_size, device)
+        centers = k_center_greedy(feats, num_to_select)
+        return np.array(topK)[centers].tolist()
+
+    raise ValueError(f"Unknown strategy: {strategy}")
 
 class ActiveLearningProgressCallback(TrainerCallback):
     """A custom Trainer callback to log progress within an active learning loop."""
@@ -121,6 +230,103 @@ class ActiveLearningProgressCallback(TrainerCallback):
             if args.report_to and "wandb" in args.report_to and wandb.run:
                  wandb.log(epoch_log, step=state.global_step)
 
+class SegmentationImageLoggerCallback(TrainerCallback):
+    """
+    A Hugging Face Trainer callback that logs a few input images,
+    ground-truth masks, and model predictions to Weights & Biases
+    during evaluation (and optionally during training).
+    """
+    def __init__(
+        self,
+        processor,
+        id2label: Dict[int, str],
+        num_samples: int = 4,
+        log_train: bool = False
+    ):
+        """
+        Args:
+            processor: the SegformerImageProcessor used to prepare pixel_values.
+            id2label: mapping class ID → class name.
+            num_samples: how many examples to log each time.
+            log_train: if True, also log during training.
+        """
+        self.processor = processor
+        self.id2label = id2label
+        self.num_samples = num_samples
+        self.log_train = log_train
+
+        # will be set by user after Trainer instantiation:
+        self.trainer = None
+        self.train_dataset = None
+        self.eval_dataset = None
+
+    def _log_batch(self, images, gt_masks, step, tag):
+        model = self.trainer.model
+        device = next(model.parameters()).device
+
+        inputs = self.processor(images, return_tensors="pt").to(device)
+        model.eval()
+        with torch.no_grad():
+            outputs = model(**inputs)
+        logits = outputs.logits  # (B, C, H', W')
+
+        # upsample
+        target_h, target_w = images[0].size[1], images[0].size[0]
+        up = torch.nn.functional.interpolate(
+            logits,
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False
+        )
+        preds = up.argmax(dim=1).cpu().numpy()
+
+        wb_images = []
+        for img, gt, pred in zip(images, gt_masks, preds):
+            if gt.mode != "P":
+                gt = gt.convert("P")
+            gt_np = np.array(gt, dtype=np.uint8)
+            wb_images.append(
+                wandb.Image(
+                    img,
+                    masks={
+                        "ground_truth": {
+                            "mask_data": gt_np,
+                            "class_labels": self.id2label
+                        },
+                        "prediction": {
+                            "mask_data": pred.astype(np.uint8),
+                            "class_labels": self.id2label
+                        }
+                    }
+                )
+            )
+
+        wandb.log({ tag: wb_images }, step=step+1)  # step+1 to avoid logging at step 0
+
+    def on_evaluate(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        if self.trainer is None:
+            return
+        ds = self.eval_dataset
+        n = min(self.num_samples, len(ds))
+        samples = ds.select(range(n))
+        pixel_values = [s["pixel_values"] for s in samples]
+        images = [Image.fromarray(pv.numpy().astype(np.uint8).transpose(1, 2, 0)) for pv in pixel_values]
+        labels = [s["labels"] for s in samples]
+        masks = [Image.fromarray(l.numpy().astype(np.uint8)) for l in labels]
+        self._log_batch(images, masks, state.global_step, "eval_samples")
+
+    def on_log(self, args, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
+        if not self.log_train or self.trainer is None or logs is None or "loss" not in logs:
+            return
+        ds = self.train_dataset
+        n = min(self.num_samples, len(ds))
+        samples = ds.select(range(n))
+        pixel_values = [s["pixel_values"] for s in samples]
+        images = [Image.fromarray(pv.numpy().astype(np.uint8).transpose(1, 2, 0)) for pv in pixel_values]
+        labels = [s["labels"] for s in samples]
+        masks = [Image.fromarray(l.numpy().astype(np.uint8)) for l in labels]
+        self._log_batch(images, masks, state.global_step, "train_samples")
+
 
 # Placeholder for VLM Feedback Logging within AL loop (if needed beyond final summary)
 def log_vlm_iteration_summary(vlm_feedback_list: List[Dict[str, Any]], current_step: int):
@@ -136,18 +342,12 @@ def log_vlm_iteration_summary(vlm_feedback_list: List[Dict[str, Any]], current_s
     actual_accuracy = actual_correct / num_samples if num_samples > 0 else 0
 
     log_data = {
-        f"AL_Step_{current_step}/VLM_Agreement_Rate": agreement_rate,
-        f"AL_Step_{current_step}/Actual_Accuracy_Sampled": actual_accuracy,
-        f"AL_Step_{current_step}/VLM_Samples": num_samples
+        f"VLM_Agreement_Rate": agreement_rate,
+        f"Actual_Accuracy_Sampled": actual_accuracy,
+        f"VLM_Samples": num_samples
     }
     wandb.log(log_data)
     logger.info(f"AL Step {current_step}: VLM Agreement Rate: {agreement_rate:.3f}, Actual Accuracy (Sampled): {actual_accuracy:.3f}")
-
-
-# Note: The main active learning loop logic will reside in the scripts
-# (train_active_learning.py, train_vlm_itl.py) as it orchestrates
-# dataset sampling, trainer initialization, training, and evaluation iteratively.
-# This file provides the helper functions for sampling.
 
 if __name__ == "__main__":
     # Example Usage
