@@ -19,6 +19,64 @@ from .log_utils import log_active_learning_summary # Import summary logger
 
 logger = logging.getLogger(__name__)
 
+from typing import Tuple, Dict
+import torch.nn.functional as F
+
+def compute_image_uncertainties(
+    model,
+    dataset,                   
+    remaining_indices: List[int],
+    preprocess_fn,
+    device,
+    batch_size: int = 8
+) -> Tuple[Dict[int, float], Dict[int, np.ndarray]]:
+    """
+    Returns:
+      uncertainties: idx -> mean-per-pixel entropy
+      model_segmentations: idx -> HxW numpy mask of model’s argmax
+    """
+    model.eval()
+
+    # select and preprocess same as before…
+    unlabeled_hf = dataset.select(remaining_indices)
+    processed = unlabeled_hf.map(
+        preprocess_fn,
+        batched=True,
+        remove_columns=dataset.column_names,
+        batch_size=batch_size,
+        load_from_cache_file=False,
+    )
+    processed.set_format("torch")
+
+    dl = DataLoader(
+        processed, batch_size=batch_size, shuffle=False,
+        collate_fn=lambda batch: {
+            k: torch.stack([d[k] for d in batch]) for k in batch[0]
+        }
+    )
+
+    uncertainties: Dict[int, float] = {}
+    model_segmentations: Dict[int, np.ndarray] = {}
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dl):
+            pix    = batch["pixel_values"].to(device)   # [B,3,H,W]
+            logits = model(pix).logits                  # [B,C,H,W]
+            probs  = F.softmax(logits, dim=1)           # [B,C,H,W]
+
+            # per-pixel entropy, then mean per image
+            ent    = -(probs * torch.log(probs + 1e-12)).sum(dim=1)  # [B,H,W]
+            img_e  = ent.view(ent.size(0), -1).mean(dim=1)           # [B]
+
+            for i, score in enumerate(img_e.cpu().tolist()):
+                orig_idx = remaining_indices[batch_idx * batch_size + i]
+                uncertainties[orig_idx] = score
+
+                # grab the argmax mask and move it to CPU + numpy
+                seg_mask = logits[i].argmax(dim=0).cpu().numpy()  # [H,W]
+                model_segmentations[orig_idx] = seg_mask
+
+    return uncertainties, model_segmentations
+
 def pad_collate(batch):
     """
     Pads all 'pixel_values' in the batch to the same H×W, and stacks __orig_idx__.

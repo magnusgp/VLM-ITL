@@ -74,8 +74,8 @@ class VLMHandler(ABC):
         vlm_answer = self.ask_binary_question(image, segmentation_mask, query)
 
         is_correct_segmentation = (predicted_label_name == ground_truth_label_name)
-        logger.info(f"VLM query: {query}, VLM answer: {vlm_answer}. Predicted label: {predicted_label_name}, GT label: {ground_truth_label_name}.")
-        logger.info(f"Is segmentation correct? {is_correct_segmentation}")
+        if random.random() < 0.1: # 10% chance to log the query
+            logger.info(f"VLM answer: {vlm_answer}. Predicted label: {predicted_label_name}, GT label: {ground_truth_label_name}.")
         # Does VLM agree with GT?
         # If seg is correct (pred==GT), VLM should say True.
         # If seg is incorrect (pred!=GT), VLM should say False.

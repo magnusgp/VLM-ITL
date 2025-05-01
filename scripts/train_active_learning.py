@@ -7,9 +7,9 @@ import random
 from functools import partial
 from typing import Dict, Any, List
 import copy # To deep copy config for modifications per iteration
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
-load_dotenv() 
+# load_dotenv() 
 
 # Add project root to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -39,7 +39,8 @@ from utils.active_learning import (
     select_next_batch_indices,
     feature_extractor_fn,
     ActiveLearningProgressCallback, 
-    SegmentationImageLoggerCallback
+    SegmentationImageLoggerCallback,
+    compute_image_uncertainties
 )
 from data.pascal_voc import (
     load_pascal_voc_dataset,
@@ -52,70 +53,12 @@ from data.pascal_voc import (
 )
 from models.segformer import load_model_for_segmentation
 
-
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from torch.utils.data import DataLoader, Subset
 import torch.nn.functional as F
-
-def compute_image_uncertainties(
-    model,
-    dataset,                   # a HuggingFace Dataset
-    remaining_indices: List[int],
-    preprocess_fn,
-    device,
-    batch_size: int = 8
-) -> Dict[int, float]:
-    """
-    Compute average per-pixel softmax entropy for each image in the
-    *unlabeled* pool (remaining_indices), returning idx -> entropy.
-    """
-    model.eval()
-
-    # 1) Select only the unlabeled examples from the HF dataset
-    unlabeled_hf = dataset.select(remaining_indices)
-
-    # 2) Preprocess them with your partial fn
-    processed = unlabeled_hf.map(
-        preprocess_fn,
-        batched=True,
-        remove_columns=dataset.column_names,
-        batch_size=batch_size,
-        load_from_cache_file=False,
-    )
-    processed.set_format("torch")
-
-    # 3) DataLoader over that processed HF Dataset
-    dl = DataLoader(
-        processed,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=lambda batch: {
-            k: torch.stack([d[k] for d in batch]) for k in batch[0]
-        }
-    )
-
-    uncertainties: Dict[int, float] = {}
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dl):
-            pix    = batch["pixel_values"].to(device)   # [B,3,H,W]
-            logits = model(pix).logits                  # [B,C,H,W]
-            probs  = F.softmax(logits, dim=1)           # [B,C,H,W]
-
-            # per-pixel entropy, then mean per image
-            ent    = -(probs * torch.log(probs + 1e-12)).sum(dim=1)  # [B,H,W]
-            img_e  = ent.view(ent.size(0), -1).mean(dim=1)           # [B]
-
-            # Map back to original dataset indices
-            for i, score in enumerate(img_e.cpu().tolist()):
-                orig_idx = remaining_indices[batch_idx * batch_size + i]
-                uncertainties[orig_idx] = score
-
-    return uncertainties
-
-
 
 def run_active_learning_pipeline(config_path: str):
     """Main function for the active learning simulation script."""
@@ -232,7 +175,7 @@ def run_active_learning_pipeline(config_path: str):
             logger.info(f"Selecting {k} new samples via entropy sampling…")
 
             # Only score the *remaining* (unlabeled) pool
-            uncertainties = compute_image_uncertainties(
+            uncertainties, _ = compute_image_uncertainties(
                 model=current_model,
                 dataset=full_train_data,
                 remaining_indices=remaining_indices,
@@ -252,8 +195,6 @@ def run_active_learning_pipeline(config_path: str):
             # Remove them from the unlabeled pool
             remaining_indices = [idx for idx in remaining_indices if idx not in new_indices]
             logger.info(f"Added {len(new_indices)} samples; now have {len(current_indices)} total.")
-
-
 
         # Create the training dataset FOR THIS ITERATION
         current_train_subset_raw = full_train_data.select(current_indices)

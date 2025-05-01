@@ -33,7 +33,8 @@ from utils.active_learning import (
     select_next_batch_indices,
     ActiveLearningProgressCallback,
     log_vlm_iteration_summary, # Import VLM summary logger
-    feature_extractor_fn
+    feature_extractor_fn,
+    compute_image_uncertainties
 )
 from utils.vlm import get_vlm_handler, VLMHandler # Import VLM factory and base class
 from data.pascal_voc import (
@@ -208,8 +209,10 @@ def run_vlm_itl_pipeline(config_path: str):
         do_reduce_labels=False
     )
     preprocess_fn = partial(
-        preprocess_data, image_processor=image_processor,
-        image_col=config['dataset']['image_col'], mask_col=config['dataset']['mask_col']
+        preprocess_data, 
+        image_processor=image_processor,
+        image_col=config['dataset']['image_col'], 
+        mask_col=config['dataset']['mask_col']
     )
     logger.info("Preprocessing fixed validation and test sets...")
     processed_val_dataset = val_dataset.map(
@@ -217,17 +220,18 @@ def run_vlm_itl_pipeline(config_path: str):
         batched=True, 
         remove_columns=val_dataset.column_names,
         batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
-        load_from_cache_file=False # Force reprocessing to avoid cache issues
+        load_from_cache_file=True # Force reprocessing to avoid cache issues
         )
     processed_test_dataset = test_dataset.map(
         preprocess_fn, 
         batched=True, 
         remove_columns=test_dataset.column_names,
         batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
-        load_from_cache_file=False # Force reprocessing to avoid cache issues)
+        load_from_cache_file=True # Force reprocessing to avoid cache issues)
     )
     processed_val_dataset.set_format("torch")
     processed_test_dataset.set_format("torch")
+    logger.info("Validation and test sets preprocessing complete.")
 
     # --- 5. Initialize Active Learning Loop Variables ---
     overall_metrics = {}
@@ -240,6 +244,7 @@ def run_vlm_itl_pipeline(config_path: str):
     current_percentage = al_config['initial_percentage']
     increment = al_config['increment_percentage']
     max_percentage = al_config['max_percentage']
+    
     num_initial = math.ceil(num_total_train * current_percentage)
     current_indices = all_train_indices[:num_initial]
     remaining_indices = all_train_indices[num_initial:]
@@ -254,63 +259,38 @@ def run_vlm_itl_pipeline(config_path: str):
 
     # --- 6. Active Learning Loop with VLM Feedback ---
     current_model = None
+    pseudo_labels: Dict[int, np.ndarray] = {}
     for i, target_percentage_int in enumerate(al_steps):
         current_al_step = i + 1
         current_data_percentage = target_percentage_int / 100.0
-
-        # --- 6a. Prepare Data for Current Iteration (Same as AL baseline) ---
-        # num_target_samples = math.ceil(num_total_train * current_data_percentage)
-        # num_current_samples = len(current_indices)
-        # num_to_add = max(0, num_target_samples - num_current_samples)
-
-        # logger.info(f"\n--- VLM-ITL Iteration {current_al_step}/{total_al_steps} ---")
-        # logger.info(f"Target Data: {target_percentage_int}% ({num_target_samples} samples)")
-
-        # if num_to_add > 0 and remaining_indices:
-        #     num_to_select = min(num_to_add, len(remaining_indices))
-        #     logger.info(f"Selecting {num_to_select} new samples (using '{al_config.get('sampling_strategy', 'random')}' strategy)...")
-        #     new_indices = select_next_batch_indices(
-        #         remaining_indices, num_to_select, strategy=al_config.get("sampling_strategy", "random")
-        #     )
-        #     current_indices.extend(new_indices)
-        #     new_indices_set = set(new_indices)
-        #     remaining_indices = [idx for idx in remaining_indices if idx not in new_indices_set]
-        #     logger.info(f"Total training samples now: {len(current_indices)}")
-
-        # current_train_subset_raw = full_train_data.select(current_indices)
-        # logger.info(f"Preprocessing training subset ({len(current_train_subset_raw)} samples)...")
-        # current_train_subset_processed = current_train_subset_raw.map(
-        #     preprocess_fn, 
-        #     batched=True, 
-        #     remove_columns=current_train_subset_raw.column_names,
-        #     batch_size=config['training'].get('per_device_train_batch_size', 8), # Use train batch size for preprocessing
-        #     load_from_cache_file=False # Force reprocessing to avoid cache issues
-        # )
-        # current_train_subset_processed.set_format("torch")
         
         # --- 6a. Propose & Pseudo-Label with VLM ---
         num_target_samples  = math.ceil(num_total_train * current_data_percentage)
         num_current_samples = len(current_indices)
         num_to_add          = max(0, num_target_samples - num_current_samples)
         logger.info(f"\n--- VLM-ITL Iteration {current_al_step}/{total_al_steps} ---")
+        
         if num_to_add > 0 and remaining_indices:
             num_to_select = min(num_to_add, len(remaining_indices))
             logger.info(f"Proposing {num_to_select} new samples for pseudo-labeling using "
                         f"'{al_config.get('sampling_strategy','random')}' strategy…")
 
             # 1) Propose a batch from the unlabeled pool
-            proposals = select_next_batch_indices(
-                remaining_indices,
-                num_to_select,
-                strategy=al_config.get("sampling_strategy", "random"),
+            uncertainties, model_segmentations = compute_image_uncertainties(
                 model=current_model,
                 dataset=full_train_data,
+                remaining_indices=remaining_indices,
                 preprocess_fn=preprocess_fn,
-                feature_extractor_fn=feature_extractor_fn,
-                device=device,
-                mc_iterations=al_config.get("mc_iterations", 5),
-                diversify_pool_factor=al_config.get("diversify_pool_factor", 10),
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                batch_size=al_config.get("inference_batch_size", 8),
             )
+
+            # Pick top-k by ascending entropy
+            proposals = sorted(
+                uncertainties, key=lambda idx: uncertainties[idx], reverse=False
+            )[:num_to_select]
+
+            logger.info(f"Top-{num_to_select} certain sample indices: {proposals}")
 
             # 2) Verify each proposal with the VLM
             accepted, rejected = [], []
@@ -338,11 +318,30 @@ def run_vlm_itl_pipeline(config_path: str):
             # 3) Update labeled / unlabeled pools
             current_indices.extend(accepted)
             remaining_indices = [idx for idx in remaining_indices if idx not in accepted]
+            
+            for idx in accepted:
+                pseudo_labels[idx] = model_segmentations[idx]
+                
+            def _replace_mask(example, idx):
+                # if we’ve got a VLM‐approved mask for this example, swap it in
+                if idx in pseudo_labels:
+                    logger.debug(f"Replacing mask for index {idx} with pseudo-label.")
+                    # our pseudo_labels[idx] is an H×W int-array; convert to uint8 + PIL
+                    arr = np.array(pseudo_labels[idx], dtype=np.uint8)
+                    pil  = Image.fromarray(arr, mode="P")
+                    return { config['dataset']['mask_col']: pil }
+                return {}
+            
+            full_train_data = full_train_data.map(
+                _replace_mask,
+                with_indices=True,
+                remove_columns=[]  # keep all other columns intact
+            )
 
         elif not remaining_indices and num_to_add > num_current_samples:
             logger.warning("No more remaining indices to sample from, but target size not reached.")
         
-        logging.warning(f"type of full train: {type(full_train_data)}")
+        logger.warning(f"type of full train: {type(full_train_data)}")
         current_train_subset_raw = full_train_data.select(current_indices)
         logger.info(f"Preprocessing training subset ({len(current_train_subset_raw)} samples)...")
         current_train_subset_processed = current_train_subset_raw.map(
@@ -350,11 +349,11 @@ def run_vlm_itl_pipeline(config_path: str):
             batched=True, 
             remove_columns=current_train_subset_raw.column_names,
             batch_size=config['training'].get('per_device_train_batch_size', 8), # Use train batch size for preprocessing
-            load_from_cache_file=False # Force reprocessing to avoid cache issues
+            load_from_cache_file=True # Force reprocessing to avoid cache issues
         )
-        logging.warning(f"type of preprocessed full train: {type(full_train_data)}")
+        logger.warning(f"type of preprocessed full train: {type(full_train_data)}")
         current_train_subset_processed.set_format("torch")
-        logging.warning(f"type of preprocessed full train: {type(full_train_data)}")
+        logger.warning(f"type of preprocessed full train: {type(full_train_data)}")
 
         # --- 6b. Setup Model and Trainer (Same as AL baseline) ---
         if current_model is None:
