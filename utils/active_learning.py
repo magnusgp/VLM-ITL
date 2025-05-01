@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import wandb
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from sklearn.metrics import pairwise_distances
 from datasets import Dataset, concatenate_datasets
@@ -36,16 +37,6 @@ def compute_image_uncertainties(
     """
     model.to(device)
     model.eval()
-
-    # # select and preprocess same as before…
-    # processed = dataset.select(remaining_indices)
-
-    # dl = DataLoader(
-    #     processed, batch_size=batch_size, shuffle=False,
-    #     collate_fn=lambda batch: {
-    #         k: torch.stack([d[k] for d in batch]) for k in batch[0]
-    #     }
-    # )
     
     raw_subset = dataset.select(remaining_indices)
     raw_subset = raw_subset.add_column("__orig_idx__", remaining_indices)
@@ -60,15 +51,16 @@ def compute_image_uncertainties(
         idxs = torch.tensor([item['__orig_idx__'] for item in batch], dtype=torch.long)
         return {"pixel_values": pix, "__orig_idx__": idxs}
 
-    dl = DataLoader(raw_subset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    dl = DataLoader(
+        raw_subset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        collate_fn=collate_fn
+    )
     uncertainties: Dict[int, float] = {}
     model_segmentations: Dict[int, np.ndarray] = {}
     with torch.no_grad():
-        # for batch_idx, batch in enumerate(dl):
-        #     pix    = batch["pixel_values"].to(device)   # [B,3,H,W]
-        #     logits = model(pix).logits                  # [B,C,H,W]
-        #     probs  = F.softmax(logits, dim=1)           # [B,C,H,W]
-        for batch in dl:
+        for batch in tqdm(dl, desc="Computing uncertainties", total=len(dl)):
             pix       = batch["pixel_values"].to(device)   # [B,3,H,W]
             orig_idxs = batch["__orig_idx__"].tolist()     # [B]
             logits    = model(pix).logits                  # [B,C,H,W]
@@ -78,8 +70,6 @@ def compute_image_uncertainties(
             ent    = -(probs * torch.log(probs + 1e-12)).sum(dim=1)  # [B,H,W]
             img_e  = ent.view(ent.size(0), -1).mean(dim=1)           # [B]
 
-            # for i, score in enumerate(img_e.cpu().tolist()):
-            #     orig_idx = remaining_indices[batch_idx * batch_size + i]
             for i, score in enumerate(img_e.cpu().tolist()):
                 orig_idx = orig_idxs[i]
                 uncertainties[orig_idx] = score

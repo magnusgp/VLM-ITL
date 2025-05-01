@@ -10,10 +10,10 @@
 #BSUB -o logs/hpc/%J.out 
 #BSUB -e logs/hpc/%J.err 
 
-cd /work3/s204144/VLM-ITL
+cd /work3/s204075/VLM-ITL
 
-export HF_HOME="/work3/s204144/.cache"
-export WANDB_DIR="/work3/s204144/.cache"
+export HF_HOME="/work3/s204075/.cache"
+export WANDB_DIR="/work3/s204075/.cache"
 
 source .venv/bin/activate
 

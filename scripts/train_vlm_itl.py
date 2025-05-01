@@ -321,7 +321,7 @@ def run_vlm_itl_pipeline(config_path: str):
                 )
                 # collect those the VLM “agrees” on
                 for idx, fb in zip(batch_idxs, feedback):
-                    if fb["vlm_agrees_with_gt"]:
+                    if fb["vlm_agrees_with_gt"] and fb["is_segmentation_correct"]:
                         accepted.append(idx)
                     else:
                         rejected.append(idx)
@@ -333,37 +333,7 @@ def run_vlm_itl_pipeline(config_path: str):
             
             for idx in accepted:
                 pseudo_labels[idx] = model_segmentations[idx]
-            
-            # num_skipped = 0
-            # logger.info(f"Pseudo-labels added for {len(pseudo_labels)} samples.")
-            # for idx, small_mask in pseudo_labels.items():
-            #     # replace the mask in the dataset
-            #     if idx in full_train_data:
-            #         # 1) fetch the original mask (PIL Image) to get its size
-            #         orig_pil = full_train_data[idx][config['dataset']['mask_col']]           # <— PIL.Image
-            #         W, H    = orig_pil.size                            # width, height
 
-            #         # 2) make a PIL from your numpy mask, then resize with NEAREST
-            #         small_pil = Image.fromarray(np.uint8(small_mask))  # 128×128
-            #         # ensure small_pil has same mode as orig_pil
-            #         if small_pil.mode != orig_pil.mode:
-            #             logger.warning(f"Mode mismatch: {small_pil.mode} vs {orig_pil.mode}. Converting...")
-            #             small_pil = small_pil.convert(orig_pil.mode)
-            #         large_pil = small_pil.resize((W, H), Image.NEAREST)
-
-            #         # 3) overwrite exactly that example’s mask
-            #         full_train_data[idx][config['dataset']['mask_col']] = large_pil
-                    
-            #         if idx == accepted[0]:
-            #             logger.info(f"First pseudo-label replacement: ({idx}) {small_pil.size} -> {large_pil.size} ({orig_pil.size})")
-            #         if idx == accepted[-1]:
-            #             logger.info(f"Last pseudo-label replacement: ({idx}) {small_pil.size} -> {large_pil.size} ({orig_pil.size})")
-            #         # 4) remove from pseudo-labels dict
-            #         del pseudo_labels[idx]
-            #     else:
-            #         num_skipped += 1
-            #         logger.warning(f"Index {idx} not found in full_train_data, skipping replacement.")
-            # logger.warning(f"Skipped {num_skipped}/{len(accepted)} pseudo-label replacements.")
             remaining_indices = [idx for idx in remaining_indices if idx not in accepted]
 
             def _inject_pseudo_processed(example, idx):
@@ -373,7 +343,7 @@ def run_vlm_itl_pipeline(config_path: str):
                     small = pseudo_labels[idx]            # numpy [h_small, w_small]
                     t = torch.from_numpy(small).unsqueeze(0).unsqueeze(0).float()
                     up = F.interpolate(t, size=(target_h, target_w), mode="nearest")
-                    return {"labels": up.squeeze().cpu().numpy().astype(np.uint8)}
+                    return {"labels": up.squeeze().cpu().numpy().astype(np.int64)}
                 return {}
 
             processed_full_train = processed_full_train.map(
@@ -438,7 +408,7 @@ def run_vlm_itl_pipeline(config_path: str):
             weight_decay=float(config['training']['weight_decay']),
 
             # strings
-            evaluation_strategy=str(config['training']['evaluation_strategy']),
+            eval_strategy=str(config['training']['evaluation_strategy']),
             save_strategy=str(config['training']['save_strategy']),
             metric_for_best_model=str(config['training']['metric_for_best_model']),
 
