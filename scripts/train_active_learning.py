@@ -5,8 +5,11 @@ import logging
 import math
 import random
 from functools import partial
-from typing import Dict, Any
+from typing import Dict, Any, List
 import copy # To deep copy config for modifications per iteration
+from dotenv import load_dotenv
+
+load_dotenv() 
 
 # Add project root to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -48,6 +51,71 @@ from data.pascal_voc import (
     NUM_PASCAL_VOC_LABELS
 )
 from models.segformer import load_model_for_segmentation
+
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+
+from torch.utils.data import DataLoader, Subset
+import torch.nn.functional as F
+
+def compute_image_uncertainties(
+    model,
+    dataset,                   # a HuggingFace Dataset
+    remaining_indices: List[int],
+    preprocess_fn,
+    device,
+    batch_size: int = 8
+) -> Dict[int, float]:
+    """
+    Compute average per-pixel softmax entropy for each image in the
+    *unlabeled* pool (remaining_indices), returning idx -> entropy.
+    """
+    model.eval()
+
+    # 1) Select only the unlabeled examples from the HF dataset
+    unlabeled_hf = dataset.select(remaining_indices)
+
+    # 2) Preprocess them with your partial fn
+    processed = unlabeled_hf.map(
+        preprocess_fn,
+        batched=True,
+        remove_columns=dataset.column_names,
+        batch_size=batch_size,
+        load_from_cache_file=False,
+    )
+    processed.set_format("torch")
+
+    # 3) DataLoader over that processed HF Dataset
+    dl = DataLoader(
+        processed,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: {
+            k: torch.stack([d[k] for d in batch]) for k in batch[0]
+        }
+    )
+
+    uncertainties: Dict[int, float] = {}
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dl):
+            pix    = batch["pixel_values"].to(device)   # [B,3,H,W]
+            logits = model(pix).logits                  # [B,C,H,W]
+            probs  = F.softmax(logits, dim=1)           # [B,C,H,W]
+
+            # per-pixel entropy, then mean per image
+            ent    = -(probs * torch.log(probs + 1e-12)).sum(dim=1)  # [B,H,W]
+            img_e  = ent.view(ent.size(0), -1).mean(dim=1)           # [B]
+
+            # Map back to original dataset indices
+            for i, score in enumerate(img_e.cpu().tolist()):
+                orig_idx = remaining_indices[batch_idx * batch_size + i]
+                uncertainties[orig_idx] = score
+
+    return uncertainties
+
+
 
 def run_active_learning_pipeline(config_path: str):
     """Main function for the active learning simulation script."""
@@ -106,14 +174,14 @@ def run_active_learning_pipeline(config_path: str):
         batched=True, 
         remove_columns=val_dataset.column_names,
         batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
-        load_from_cache_file=False # Force reprocessing to avoid cache issues
+        load_from_cache_file=True # Force reprocessing to avoid cache issues
     )
     processed_test_dataset = test_dataset.map(
         preprocess_fn, 
         batched=True, 
         remove_columns=test_dataset.column_names,
         batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
-        load_from_cache_file=False # Force reprocessing to avoid cache issues
+        load_from_cache_file=True # Force reprocessing to avoid cache issues
     )
     processed_val_dataset.set_format("torch")
     processed_test_dataset.set_format("torch")
@@ -158,35 +226,34 @@ def run_active_learning_pipeline(config_path: str):
         logger.info(f"Target Data: {target_percentage_int}% ({num_target_samples} samples)")
         logger.info(f"Current Data: {num_current_samples} samples")
 
+        # --- 6a. Active Learning Sampling (entropy-based) ---
         if num_to_add > 0 and remaining_indices:
-            num_to_select = min(num_to_add, len(remaining_indices))
-            logger.info(f"Selecting {num_to_select} new samples...")
-            # new_indices = select_next_batch_indices(
-            #     remaining_indices,
-            #     num_to_select,
-            #     strategy=al_config.get("sampling_strategy", "random")
-            #     # Pass model/data if needed for advanced strategies
-            # )
-            # 1) Propose a batch from the unlabeled pool
-            new_indices = select_next_batch_indices(
-                remaining_indices,
-                num_to_select,
-                strategy=al_config.get("sampling_strategy", "random"),
+            k = min(num_to_add, len(remaining_indices))
+            logger.info(f"Selecting {k} new samples via entropy sampling…")
+
+            # Only score the *remaining* (unlabeled) pool
+            uncertainties = compute_image_uncertainties(
                 model=current_model,
                 dataset=full_train_data,
+                remaining_indices=remaining_indices,
                 preprocess_fn=preprocess_fn,
-                feature_extractor_fn=feature_extractor_fn,
                 device="cuda" if torch.cuda.is_available() else "cpu",
-                mc_iterations=al_config.get("mc_iterations", 5),
-                diversify_pool_factor=al_config.get("diversify_pool_factor", 10),
+                batch_size=al_config.get("inference_batch_size", 8),
             )
+
+            # Pick top-k by descending entropy
+            new_indices = sorted(
+                uncertainties, key=lambda idx: uncertainties[idx], reverse=True
+            )[:k]
+
+            logger.info(f"Top-{k} uncertain sample indices: {new_indices}")
             current_indices.extend(new_indices)
-            # Update remaining indices (more efficient to convert to sets if large)
-            new_indices_set = set(new_indices)
-            remaining_indices = [idx for idx in remaining_indices if idx not in new_indices_set]
-            logger.info(f"Added {len(new_indices)} samples. Total training samples now: {len(current_indices)}")
-        elif not remaining_indices and num_target_samples > num_current_samples:
-             logger.warning("No more remaining indices to sample from, but target size not reached. Using current set.")
+
+            # Remove them from the unlabeled pool
+            remaining_indices = [idx for idx in remaining_indices if idx not in new_indices]
+            logger.info(f"Added {len(new_indices)} samples; now have {len(current_indices)} total.")
+
+
 
         # Create the training dataset FOR THIS ITERATION
         current_train_subset_raw = full_train_data.select(current_indices)
@@ -412,7 +479,7 @@ if __name__ == "__main__":
 
     # Setup basic logging
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )

@@ -341,7 +341,8 @@ def run_vlm_itl_pipeline(config_path: str):
 
         elif not remaining_indices and num_to_add > num_current_samples:
             logger.warning("No more remaining indices to sample from, but target size not reached.")
-            
+        
+        logging.warning(f"type of full train: {type(full_train_data)}")
         current_train_subset_raw = full_train_data.select(current_indices)
         logger.info(f"Preprocessing training subset ({len(current_train_subset_raw)} samples)...")
         current_train_subset_processed = current_train_subset_raw.map(
@@ -351,7 +352,9 @@ def run_vlm_itl_pipeline(config_path: str):
             batch_size=config['training'].get('per_device_train_batch_size', 8), # Use train batch size for preprocessing
             load_from_cache_file=False # Force reprocessing to avoid cache issues
         )
+        logging.warning(f"type of preprocessed full train: {type(full_train_data)}")
         current_train_subset_processed.set_format("torch")
+        logging.warning(f"type of preprocessed full train: {type(full_train_data)}")
 
         # --- 6b. Setup Model and Trainer (Same as AL baseline) ---
         if current_model is None:
@@ -535,7 +538,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
 
     try:
         run_vlm_itl_pipeline(args.config)

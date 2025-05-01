@@ -115,7 +115,9 @@ def compute_lc_uncertainty(model, loader, pool, device):
         for batch in loader:
             inputs = {k: v.to(device) for k, v in batch.items()
                       if k not in pool.column_names + ["__orig_idx__"]}
+            logger.warning(inputs)
             logits = model(**inputs).logits
+            logger.warning(logits.shape)
             probs = torch.softmax(logits, dim=1)
             if probs.ndim == 4:  # segmentation
                 m, _ = probs.max(dim=1)          # [B,H,W]
