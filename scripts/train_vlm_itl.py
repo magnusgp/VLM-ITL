@@ -13,6 +13,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
@@ -46,6 +47,10 @@ from data.pascal_voc import (
     NUM_PASCAL_VOC_LABELS
 )
 from models.segformer import load_model_for_segmentation
+
+# suppress datasets pillow downcast warning
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="datasets")
 
 # --- Helper function for VLM Feedback Simulation ---
 def simulate_vlm_feedback_on_batch(
@@ -229,8 +234,15 @@ def run_vlm_itl_pipeline(config_path: str):
         batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
         load_from_cache_file=True # Force reprocessing to avoid cache issues)
     )
+    processed_full_train = full_train_data.map(
+        preprocess_fn, batched=True,
+        remove_columns=full_train_data.column_names,
+        batch_size=config['training']['per_device_train_batch_size'],
+        load_from_cache_file=True
+    )
     processed_val_dataset.set_format("torch")
     processed_test_dataset.set_format("torch")
+    processed_full_train.set_format("torch")
     logger.info("Validation and test sets preprocessing complete.")
 
     # --- 5. Initialize Active Learning Loop Variables ---
@@ -295,7 +307,8 @@ def run_vlm_itl_pipeline(config_path: str):
             # 2) Verify each proposal with the VLM
             accepted, rejected = [], []
             per_device = config['training']['per_device_eval_batch_size']
-            for start in range(0, len(proposals), per_device):
+            # for start in range(0, len(proposals), per_device):
+            for start in range(0, 10, per_device): # HACK: Limit to 10 for testing
                 batch_idxs = proposals[start : start + per_device]
                 batch_raw = full_train_data.select(batch_idxs)
                 feedback = simulate_vlm_feedback_on_batch(
@@ -317,28 +330,60 @@ def run_vlm_itl_pipeline(config_path: str):
 
             # 3) Update labeled / unlabeled pools
             current_indices.extend(accepted)
-            remaining_indices = [idx for idx in remaining_indices if idx not in accepted]
             
             for idx in accepted:
                 pseudo_labels[idx] = model_segmentations[idx]
-                
-            def _replace_mask(example, idx):
-                # if we’ve got a VLM‐approved mask for this example, swap it in
-                if idx in pseudo_labels:
-                    logger.debug(f"Replacing mask for index {idx} with pseudo-label.")
-                    # our pseudo_labels[idx] is an H×W int-array; convert to uint8 + PIL
-                    arr = np.array(pseudo_labels[idx], dtype=np.uint8)
-                    pil  = Image.fromarray(arr, mode="P")
-                    return { config['dataset']['mask_col']: pil }
-                return {}
             
-            full_train_data = full_train_data.map(
-                _replace_mask,
-                with_indices=True,
-                remove_columns=[]  # keep all other columns intact
-            )
+            # num_skipped = 0
+            # logger.info(f"Pseudo-labels added for {len(pseudo_labels)} samples.")
+            # for idx, small_mask in pseudo_labels.items():
+            #     # replace the mask in the dataset
+            #     if idx in full_train_data:
+            #         # 1) fetch the original mask (PIL Image) to get its size
+            #         orig_pil = full_train_data[idx][config['dataset']['mask_col']]           # <— PIL.Image
+            #         W, H    = orig_pil.size                            # width, height
 
-        elif not remaining_indices and num_to_add > num_current_samples:
+            #         # 2) make a PIL from your numpy mask, then resize with NEAREST
+            #         small_pil = Image.fromarray(np.uint8(small_mask))  # 128×128
+            #         # ensure small_pil has same mode as orig_pil
+            #         if small_pil.mode != orig_pil.mode:
+            #             logger.warning(f"Mode mismatch: {small_pil.mode} vs {orig_pil.mode}. Converting...")
+            #             small_pil = small_pil.convert(orig_pil.mode)
+            #         large_pil = small_pil.resize((W, H), Image.NEAREST)
+
+            #         # 3) overwrite exactly that example’s mask
+            #         full_train_data[idx][config['dataset']['mask_col']] = large_pil
+                    
+            #         if idx == accepted[0]:
+            #             logger.info(f"First pseudo-label replacement: ({idx}) {small_pil.size} -> {large_pil.size} ({orig_pil.size})")
+            #         if idx == accepted[-1]:
+            #             logger.info(f"Last pseudo-label replacement: ({idx}) {small_pil.size} -> {large_pil.size} ({orig_pil.size})")
+            #         # 4) remove from pseudo-labels dict
+            #         del pseudo_labels[idx]
+            #     else:
+            #         num_skipped += 1
+            #         logger.warning(f"Index {idx} not found in full_train_data, skipping replacement.")
+            # logger.warning(f"Skipped {num_skipped}/{len(accepted)} pseudo-label replacements.")
+            remaining_indices = [idx for idx in remaining_indices if idx not in accepted]
+
+            def _inject_pseudo_processed(example, idx):
+                if idx in pseudo_labels:
+                    # your processed_full_train already has example["labels"] at e.g. (H_proc,W_proc)
+                    target_h, target_w = example["labels"].shape
+                    small = pseudo_labels[idx]            # numpy [h_small, w_small]
+                    t = torch.from_numpy(small).unsqueeze(0).unsqueeze(0).float()
+                    up = F.interpolate(t, size=(target_h, target_w), mode="nearest")
+                    return {"labels": up.squeeze().cpu().numpy().astype(np.uint8)}
+                return {}
+
+            processed_full_train = processed_full_train.map(
+                _inject_pseudo_processed,
+                with_indices=True,
+                batched=False,
+                remove_columns=[]
+            )
+            
+        elif len(remaining_indices) == 0 and num_to_add > num_current_samples:
             logger.warning("No more remaining indices to sample from, but target size not reached.")
         
         logger.warning(f"type of full train: {type(full_train_data)}")
@@ -393,7 +438,7 @@ def run_vlm_itl_pipeline(config_path: str):
             weight_decay=float(config['training']['weight_decay']),
 
             # strings
-            eval_strategy=str(config['training']['evaluation_strategy']),
+            evaluation_strategy=str(config['training']['evaluation_strategy']),
             save_strategy=str(config['training']['save_strategy']),
             metric_for_best_model=str(config['training']['metric_for_best_model']),
 
@@ -532,15 +577,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        required=True,
+        # required=True,
+        default="configs/vlm_itl_config.yaml",
         help="Path to the configuration YAML file (should include vlm_itl settings)."
     )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
-
-    try:
-        run_vlm_itl_pipeline(args.config)
-    except Exception as e:
-        logger.error("An error occurred during the VLM-ITL pipeline.", exc_info=True)
-        sys.exit(1)
+    run_vlm_itl_pipeline(args.config) # for proper debug failure
+    # try:
+    #     run_vlm_itl_pipeline(args.config)
+    # except Exception as e:
+    #     logger.error("An error occurred during the VLM-ITL pipeline.", exc_info=True)
+    #     sys.exit(1)
