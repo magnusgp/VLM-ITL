@@ -307,8 +307,7 @@ def run_vlm_itl_pipeline(config_path: str):
             # 2) Verify each proposal with the VLM
             accepted, rejected = [], []
             per_device = config['training']['per_device_eval_batch_size']
-            # for start in range(0, len(proposals), per_device):
-            for start in range(0, 10, per_device): # HACK: Limit to 10 for testing
+            for start in range(0, len(proposals), per_device):
                 batch_idxs = proposals[start : start + per_device]
                 batch_raw = full_train_data.select(batch_idxs)
                 feedback = simulate_vlm_feedback_on_batch(
@@ -426,7 +425,13 @@ def run_vlm_itl_pipeline(config_path: str):
             push_to_hub=False
         )
         compute_metrics_fn = partial(compute_metrics_segmentation, num_labels=NUM_PASCAL_VOC_LABELS, ignore_index=255)
-        al_progress_callback = ActiveLearningProgressCallback(total_al_steps, current_al_step, current_data_percentage)
+        al_progress_callback = ActiveLearningProgressCallback(
+            total_al_steps, 
+            current_al_step, 
+            current_data_percentage,
+            number_of_samples=len(current_indices),
+            total_number_of_samples=num_total_train,
+        )
         early_stopping_callback = EarlyStoppingCallback(
             config['training'].get('early_stopping_patience', 3), config['training'].get('early_stopping_threshold', 0.0)
         )

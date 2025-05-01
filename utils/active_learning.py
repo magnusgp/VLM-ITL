@@ -320,16 +320,20 @@ def select_next_batch_indices(
 
 class ActiveLearningProgressCallback(TrainerCallback):
     """A custom Trainer callback to log progress within an active learning loop."""
-    def __init__(self, total_al_steps: int, current_al_step: int, current_data_percentage: float):
+    def __init__(self, total_al_steps: int, current_al_step: int, current_data_percentage: float, number_of_samples: int = 0, total_number_of_samples: int = 0):
         self.total_al_steps = total_al_steps
         self.current_al_step = current_al_step
         self.current_data_percentage = current_data_percentage
+        self.number_of_samples = number_of_samples
+        self.total_number_of_samples = total_number_of_samples
 
     def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
         """Adds active learning context to logs."""
         if state.is_world_process_zero and logs is not None: # Log only on main process
              logs["al_step"] = f"{self.current_al_step}/{self.total_al_steps}"
              logs["al_data_percentage"] = self.current_data_percentage
+             logs["num_samples"] = self.number_of_samples # Log number of samples in AL step
+             logs["total_num_samples"] = self.total_number_of_samples # Log total number of samples
              # Note: wandb integration in Trainer automatically picks up these logs
 
     def on_epoch_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
@@ -338,6 +342,8 @@ class ActiveLearningProgressCallback(TrainerCallback):
             epoch_log = {
                 "al_step": f"{self.current_al_step}/{self.total_al_steps}",
                 "al_data_percentage": self.current_data_percentage,
+                "num_samples": self.number_of_samples, # Log number of samples in AL step
+                "total_num_samples": self.total_number_of_samples, # Log total number of samples
                 "epoch": state.epoch # Log current epoch within AL step
             }
             # Use wandb.log if available and configured
