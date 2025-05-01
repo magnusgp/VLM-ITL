@@ -1,5 +1,5 @@
 project_name: "pascal-voc-segmentation"
-run_name_prefix: "active-learning-segformer-b4" # Run name will be appended with iteration info
+run_name_prefix: "AL-b4-BD" # Run name will be appended with iteration info
 output_dir_prefix: "./results/active_learning" # Output dir will be appended
 seed: 42
 log_with: "wandb"
@@ -20,8 +20,8 @@ model:
   ignore_mismatched_sizes: True
 
 training: # Params per Active Learning Iteration
-  per_device_train_batch_size: 16
-  per_device_eval_batch_size: 16
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
   num_train_epochs: 20 # Fewer epochs per iteration? Or same as baseline? Let's use fewer.
   learning_rate: 6e-5
   weight_decay: 0.01
@@ -46,13 +46,4 @@ active_learning:
   initial_percentage: 0.2 # Start with 20% of training data
   increment_percentage: 0.2 # Add 20% each iteration
   max_percentage: 1.0 # Go up to 100%
-  sampling_strategy: "random" # Could be extended (e.g., "uncertainty")
-
-vlm_itl: # Configuration for the VLM-ITL run (can be in the same file or separate)
-  enabled: False # Set to True for the VLM-ITL script
-  run_name_prefix: "vlm-itl-segformer-b4"
-  output_dir_prefix: "./results/vlm_itl"
-  vlm_handler: "mock" # Type of VLM handler ('mock', 'huggingface_blip', etc.)
-  vlm_options: # Options passed to VLM handler constructor
-    mock_accuracy: 0.85 # If using mock handler
-  vlm_query_template: "Is the primary object in this segmented region correctly identified as {label_name}?"
+  sampling_strategy: "bald_diversity" # Sampling strategy for active learning (random, lc (least confidence), bald_diversity (BALD-MC + k-center greedy sampling))

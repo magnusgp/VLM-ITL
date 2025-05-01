@@ -24,9 +24,20 @@ from transformers import (
 from datasets import Dataset, DatasetDict, concatenate_datasets
 
 from utils.config import load_config
-from utils.log_utils import setup_wandb, logger, log_active_learning_summary, debug_log_and_plot
+from utils.log_utils import (
+    setup_wandb, 
+    logger, 
+    log_active_learning_summary, 
+    debug_log_and_plot
+)
 from utils.metrics import compute_metrics_segmentation
-from utils.active_learning import sample_initial_data, select_next_batch_indices, ActiveLearningProgressCallback, SegmentationImageLoggerCallback
+from utils.active_learning import (
+    sample_initial_data, 
+    select_next_batch_indices,
+    feature_extractor_fn,
+    ActiveLearningProgressCallback, 
+    SegmentationImageLoggerCallback
+)
 from data.pascal_voc import (
     load_pascal_voc_dataset,
     preprocess_data,
@@ -150,11 +161,24 @@ def run_active_learning_pipeline(config_path: str):
         if num_to_add > 0 and remaining_indices:
             num_to_select = min(num_to_add, len(remaining_indices))
             logger.info(f"Selecting {num_to_select} new samples...")
+            # new_indices = select_next_batch_indices(
+            #     remaining_indices,
+            #     num_to_select,
+            #     strategy=al_config.get("sampling_strategy", "random")
+            #     # Pass model/data if needed for advanced strategies
+            # )
+            # 1) Propose a batch from the unlabeled pool
             new_indices = select_next_batch_indices(
                 remaining_indices,
                 num_to_select,
-                strategy=al_config.get("sampling_strategy", "random")
-                # Pass model/data if needed for advanced strategies
+                strategy=al_config.get("sampling_strategy", "random"),
+                model=current_model,
+                dataset=full_train_data,
+                preprocess_fn=preprocess_fn,
+                feature_extractor_fn=feature_extractor_fn,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                mc_iterations=al_config.get("mc_iterations", 5),
+                diversify_pool_factor=al_config.get("diversify_pool_factor", 10),
             )
             current_indices.extend(new_indices)
             # Update remaining indices (more efficient to convert to sets if large)
@@ -255,12 +279,13 @@ def run_active_learning_pipeline(config_path: str):
             current_al_step=current_al_step,
             current_data_percentage=current_data_percentage
         )
-        image_logger_callback = SegmentationImageLoggerCallback(
-            processor=image_processor,
-            id2label=PASCAL_VOC_ID2LABEL,
-            num_samples=3,
-            log_train=True
-        )
+        image_logger_callback = None
+        # image_logger_callback = SegmentationImageLoggerCallback(
+        #     processor=image_processor,
+        #     id2label=PASCAL_VOC_ID2LABEL,
+        #     num_samples=3,
+        #     log_train=True
+        # )
         # Optional: Add Early Stopping per iteration
         early_stopping_callback = EarlyStoppingCallback(
             early_stopping_patience=config['training'].get('early_stopping_patience', 3),
@@ -274,13 +299,13 @@ def run_active_learning_pipeline(config_path: str):
             train_dataset=current_train_subset_processed,
             eval_dataset=processed_val_dataset, # Use the FIXED validation set
             compute_metrics=compute_metrics_fn,
-            callbacks=[al_progress_callback, early_stopping_callback, image_logger_callback] # Add callbacks
+            callbacks=[al_progress_callback, early_stopping_callback, image_logger_callback] if image_logger_callback else [al_progress_callback, early_stopping_callback],
             # No need to pass model_init if we reuse the model object
         )
-        
-        image_logger_callback.trainer = trainer # Set trainer for the callback
-        image_logger_callback.train_dataset = current_train_subset_processed # Set train dataset for logging
-        image_logger_callback.eval_dataset = processed_val_dataset # Set eval dataset for logging
+        if image_logger_callback:
+            image_logger_callback.trainer = trainer # Set trainer for the callback
+            image_logger_callback.train_dataset = current_train_subset_processed # Set train dataset for logging
+            image_logger_callback.eval_dataset = processed_val_dataset # Set eval dataset for logging
         
         if config.get('debug', False):
             logger.info("Debugging mode enabled. Logging a batch of data.")

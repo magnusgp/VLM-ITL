@@ -32,7 +32,8 @@ from utils.active_learning import (
     sample_initial_data,
     select_next_batch_indices,
     ActiveLearningProgressCallback,
-    log_vlm_iteration_summary # Import VLM summary logger
+    log_vlm_iteration_summary, # Import VLM summary logger
+    feature_extractor_fn
 )
 from utils.vlm import get_vlm_handler, VLMHandler # Import VLM factory and base class
 from data.pascal_voc import (
@@ -258,24 +259,89 @@ def run_vlm_itl_pipeline(config_path: str):
         current_data_percentage = target_percentage_int / 100.0
 
         # --- 6a. Prepare Data for Current Iteration (Same as AL baseline) ---
-        num_target_samples = math.ceil(num_total_train * current_data_percentage)
+        # num_target_samples = math.ceil(num_total_train * current_data_percentage)
+        # num_current_samples = len(current_indices)
+        # num_to_add = max(0, num_target_samples - num_current_samples)
+
+        # logger.info(f"\n--- VLM-ITL Iteration {current_al_step}/{total_al_steps} ---")
+        # logger.info(f"Target Data: {target_percentage_int}% ({num_target_samples} samples)")
+
+        # if num_to_add > 0 and remaining_indices:
+        #     num_to_select = min(num_to_add, len(remaining_indices))
+        #     logger.info(f"Selecting {num_to_select} new samples (using '{al_config.get('sampling_strategy', 'random')}' strategy)...")
+        #     new_indices = select_next_batch_indices(
+        #         remaining_indices, num_to_select, strategy=al_config.get("sampling_strategy", "random")
+        #     )
+        #     current_indices.extend(new_indices)
+        #     new_indices_set = set(new_indices)
+        #     remaining_indices = [idx for idx in remaining_indices if idx not in new_indices_set]
+        #     logger.info(f"Total training samples now: {len(current_indices)}")
+
+        # current_train_subset_raw = full_train_data.select(current_indices)
+        # logger.info(f"Preprocessing training subset ({len(current_train_subset_raw)} samples)...")
+        # current_train_subset_processed = current_train_subset_raw.map(
+        #     preprocess_fn, 
+        #     batched=True, 
+        #     remove_columns=current_train_subset_raw.column_names,
+        #     batch_size=config['training'].get('per_device_train_batch_size', 8), # Use train batch size for preprocessing
+        #     load_from_cache_file=False # Force reprocessing to avoid cache issues
+        # )
+        # current_train_subset_processed.set_format("torch")
+        
+        # --- 6a. Propose & Pseudo-Label with VLM ---
+        num_target_samples  = math.ceil(num_total_train * current_data_percentage)
         num_current_samples = len(current_indices)
-        num_to_add = max(0, num_target_samples - num_current_samples)
-
+        num_to_add          = max(0, num_target_samples - num_current_samples)
         logger.info(f"\n--- VLM-ITL Iteration {current_al_step}/{total_al_steps} ---")
-        logger.info(f"Target Data: {target_percentage_int}% ({num_target_samples} samples)")
-
         if num_to_add > 0 and remaining_indices:
             num_to_select = min(num_to_add, len(remaining_indices))
-            logger.info(f"Selecting {num_to_select} new samples (using '{al_config.get('sampling_strategy', 'random')}' strategy)...")
-            new_indices = select_next_batch_indices(
-                remaining_indices, num_to_select, strategy=al_config.get("sampling_strategy", "random")
-            )
-            current_indices.extend(new_indices)
-            new_indices_set = set(new_indices)
-            remaining_indices = [idx for idx in remaining_indices if idx not in new_indices_set]
-            logger.info(f"Total training samples now: {len(current_indices)}")
+            logger.info(f"Proposing {num_to_select} new samples for pseudo-labeling using "
+                        f"'{al_config.get('sampling_strategy','random')}' strategy…")
 
+            # 1) Propose a batch from the unlabeled pool
+            proposals = select_next_batch_indices(
+                remaining_indices,
+                num_to_select,
+                strategy=al_config.get("sampling_strategy", "random"),
+                model=current_model,
+                dataset=full_train_data,
+                preprocess_fn=preprocess_fn,
+                feature_extractor_fn=feature_extractor_fn,
+                device=device,
+                mc_iterations=al_config.get("mc_iterations", 5),
+                diversify_pool_factor=al_config.get("diversify_pool_factor", 10),
+            )
+
+            # 2) Verify each proposal with the VLM
+            accepted, rejected = [], []
+            per_device = config['training']['per_device_eval_batch_size']
+            for start in range(0, len(proposals), per_device):
+                batch_idxs = proposals[start : start + per_device]
+                batch_raw = full_train_data.select(batch_idxs)
+                feedback = simulate_vlm_feedback_on_batch(
+                    vlm_handler,
+                    current_model,
+                    batch_raw,
+                    image_processor,
+                    config,
+                    device
+                )
+                # collect those the VLM “agrees” on
+                for idx, fb in zip(batch_idxs, feedback):
+                    if fb["vlm_agrees_with_gt"]:
+                        accepted.append(idx)
+                    else:
+                        rejected.append(idx)
+
+            logger.info(f"VLM accepted {len(accepted)} samples, rejected {len(rejected)}")
+
+            # 3) Update labeled / unlabeled pools
+            current_indices.extend(accepted)
+            remaining_indices = [idx for idx in remaining_indices if idx not in accepted]
+
+        elif not remaining_indices and num_to_add > num_current_samples:
+            logger.warning("No more remaining indices to sample from, but target size not reached.")
+            
         current_train_subset_raw = full_train_data.select(current_indices)
         logger.info(f"Preprocessing training subset ({len(current_train_subset_raw)} samples)...")
         current_train_subset_processed = current_train_subset_raw.map(

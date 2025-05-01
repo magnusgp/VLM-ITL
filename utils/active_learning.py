@@ -4,6 +4,7 @@ import logging
 from typing import List, Tuple, Dict, Optional, Callable, Any
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import wandb
 from torch.utils.data import DataLoader
@@ -17,6 +18,36 @@ from .log_utils import log_active_learning_summary # Import summary logger
 
 
 logger = logging.getLogger(__name__)
+
+def pad_collate(batch):
+    """
+    Pads all 'pixel_values' in the batch to the same H×W, and stacks __orig_idx__.
+    Assumes each item is a dict with keys:
+      - 'pixel_values': Tensor[C, H_i, W_i]
+      - '__orig_idx__': int
+      - possibly other keys which we ignore here
+    """
+    # find max H and W
+    heights = [item['pixel_values'].shape[1] for item in batch]
+    widths  = [item['pixel_values'].shape[2] for item in batch]
+    max_h, max_w = max(heights), max(widths)
+
+    pix_vals, orig_idxs = [], []
+    for item in batch:
+        pv = item['pixel_values']
+        c, h, w = pv.shape
+        pad_h = max_h - h
+        pad_w = max_w - w
+        # pad (left, right, top, bottom)
+        pv = F.pad(pv, (0, pad_w, 0, pad_h), value=0)
+        pix_vals.append(pv)
+        orig_idxs.append(item['__orig_idx__'])
+
+    return {
+      'pixel_values': torch.stack(pix_vals, dim=0),
+      '__orig_idx__': torch.tensor(orig_idxs, dtype=torch.long),
+    }
+
 
 def sample_initial_data(
     full_train_dataset: Dataset,
@@ -64,7 +95,11 @@ def build_pool(dataset, indices, preprocess_fn, batch_size):
     pool = pool.add_column("__orig_idx__", indices)
     pool_proc = pool.map(preprocess_fn, batched=True)
     pool_proc.set_format("torch")
-    loader = DataLoader(pool_proc, batch_size=batch_size)
+    loader = DataLoader(
+        pool_proc, 
+        batch_size=batch_size,
+        collate_fn=pad_collate,
+    )
     return pool, loader
 
 
@@ -133,7 +168,11 @@ def extract_features(model, dataset, indices, preprocess_fn, feature_extractor_f
     subpool = dataset.select(indices)
     subpool_proc = subpool.map(preprocess_fn, batched=True)
     subpool_proc.set_format("torch")
-    loader = DataLoader(subpool_proc, batch_size=batch_size)
+    loader = DataLoader(
+        subpool_proc, 
+        batch_size=batch_size,
+        collate_fn=pad_collate,
+    )
     feats = []
     for batch in loader:
         inputs = {k: v.to(device) for k, v in batch.items()
@@ -158,6 +197,18 @@ def k_center_greedy(feats, select_count):
             centers.append(int(np.argmax(dist_to_centers)))
     return centers
 
+def feature_extractor_fn(model, inputs):
+    """
+    Given a Segformer model and a batch of inputs, returns encoder feature maps
+    for k-Center Greedy.
+    """
+    # inputs must contain 'pixel_values' tensor
+    outputs = model.segformer.encoder(
+        pixel_values=inputs['pixel_values'],
+        return_dict=True
+    )
+    # last_hidden_state: [B, D, H, W]
+    return outputs.last_hidden_state
 
 def select_next_batch_indices(
     available_indices,
