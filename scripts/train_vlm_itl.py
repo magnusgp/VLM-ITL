@@ -342,15 +342,21 @@ def run_vlm_itl_pipeline(config_path: str):
                     small = pseudo_labels[idx]            # numpy [h_small, w_small]
                     t = torch.from_numpy(small).unsqueeze(0).unsqueeze(0).float()
                     up = F.interpolate(t, size=(target_h, target_w), mode="nearest")
+                    if up.squeeze().shape != example["labels"].shape:
+                        logger.warning(f"Shape mismatch: {up.squeeze().shape} vs {example['labels'].shape}")
+                        return {}
                     return {"labels": up.squeeze().cpu().numpy().astype(np.int64)}
                 return {}
-
-            processed_full_train = processed_full_train.map(
-                _inject_pseudo_processed,
-                with_indices=True,
-                batched=False,
-                remove_columns=[]
-            )
+            try:
+                processed_full_train = processed_full_train.map(
+                    _inject_pseudo_processed,
+                    with_indices=True,
+                    remove_columns=[]
+                )
+            # except wierd pyarrow error
+            except Exception as e:
+                logger.error(f"Error during pseudo-label injection: {e}", exc_info=True)
+                continue
             
         elif len(remaining_indices) == 0 and num_to_add > num_current_samples:
             logger.warning("No more remaining indices to sample from, but target size not reached.")
