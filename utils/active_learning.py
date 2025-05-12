@@ -11,6 +11,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from sklearn.metrics import pairwise_distances
 from datasets import Dataset, concatenate_datasets
+import datasets.features
 from transformers import Trainer, TrainingArguments, TrainerCallback, TrainerState, TrainerControl
 from PIL import Image
 
@@ -21,6 +22,25 @@ logger = logging.getLogger(__name__)
 
 from typing import Tuple, Dict
 import torch.nn.functional as F
+
+def compute_mean_iou(true_mask: np.ndarray, pred_mask: np.ndarray, num_classes: int = None) -> float:
+    """
+    Compute the mean per-class IoU between two H×W integer masks.
+    Classes with no pixels in both true and pred are ignored.
+    """
+    t = true_mask.flatten()
+    p = pred_mask.flatten()
+    if num_classes is None:
+        num_classes = int(max(t.max(), p.max()) + 1)
+    ious = []
+    for c in range(num_classes):
+        t_c = (t == c)
+        p_c = (p == c)
+        inter = np.logical_and(t_c, p_c).sum()
+        union = np.logical_or(t_c, p_c).sum()
+        if union > 0:
+            ious.append(inter / union)
+    return float(np.mean(ious)) if ious else 0.0
 
 def compute_image_uncertainties(
     model,
