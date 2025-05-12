@@ -207,7 +207,7 @@ def preprocess_data(
         label_masks.append(idx_map)
 
     # Convert pixel_values_batch to list to satisfy arrow‐map requirements
-    pixel_list = [pixel_values_batch[i] for i in range(pixel_values_batch.shape[0])]
+    pixel_list = [pixel_values_batch[i].contiguous() for i in range(pixel_values_batch.shape[0])]
     label_masks = torch.tensor(np.array(label_masks, dtype=np.int64), dtype=torch.int64)
 
     return {

@@ -2,7 +2,7 @@ project_name: "pascal-voc-segmentation"
 run_name_prefix: "AL-b4-BD" # Run name will be appended with iteration info
 output_dir_prefix: "./results/active_learning" # Output dir will be appended
 seed: 42
-log_with: "wandb"
+log_with: "none"
 debug: False # Set to True for debugging purposes
 
 dataset:

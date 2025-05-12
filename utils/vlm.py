@@ -185,7 +185,7 @@ class HuggingFaceVLMHandler(VLMHandler):
 
     def _load_model(self):
         try:
-            from transformers import pipeline
+            from transformers import pipeline # Ensure pipeline is imported here
             model_name = self.config.get("vlm_model_name", "Salesforce/blip-vqa-base") # Example
             task = "visual-question-answering"
             logger.info(f"Loading VLM pipeline: {model_name} for task: {task}")
@@ -211,30 +211,35 @@ class HuggingFaceVLMHandler(VLMHandler):
 
         try:
             # Ensure prompt clearly asks a yes/no question
-            if not prompt.lower().strip().startswith(("is ", "are ", "does ", "do ", "can ", "will ")):
-                 logger.warning(f"VLM prompt '{prompt}' might not be a clear yes/no question.")
+            if not prompt.lower().strip().startswith((
+                "is ", "are ", "does ", "do ", "can ", "will ", 
+                "should ", "has ", "have ", "was ", "were ", "did ")):
+                 logger.warning(f"Prompt '{prompt}' may not be a typical binary question. VLM might not give a clear yes/no.")
 
-            # Combine image and prompt for VQA pipeline
-            # The pipeline might require specific input formats
-            result = self.pipeline(image, prompt, top_k=1) # Get the top answer
+            # For most VQA pipelines, only the image and question are standard inputs.
+            # If the segmentation_mask is meant to be part of the visual input,
+            # it would typically need to be overlaid on the image before this call.
+            result = self.pipeline(image, question=prompt, top_k=1) # Get the top answer
 
             # Process the result to get a boolean answer
+            if not result or not isinstance(result, list) or not result[0] or 'answer' not in result[0]:
+                logger.error(f"VLM returned an unexpected result format for prompt '{prompt}'. Result: {result}")
+                return False # Fallback for unexpected format
+            
             answer_text = result[0]['answer'].lower().strip()
             logger.debug(f"VLM raw answer for '{prompt}': {answer_text}")
 
-            # Simple yes/no parsing (can be improved)
+            # Simple yes/no parsing
             if answer_text.startswith("yes"):
                 return True
             elif answer_text.startswith("no"):
                 return False
             else:
-                # Ambiguous answer, default to False or raise an error?
-                logger.warning(f"VLM answer '{answer_text}' is ambiguous for binary question. Defaulting to False.")
+                logger.warning(f"VLM answer '{answer_text}' to prompt '{prompt}' is not a clear yes/no. Defaulting to False.")
                 return False
 
         except Exception as e:
-            logger.error(f"Error during VLM inference: {e}", exc_info=True)
-            # Fallback strategy: return False or raise?
+            logger.error(f"Error during VLM inference for prompt '{prompt}': {e}", exc_info=True)
             return False
 
 def get_vlm_handler(config: Dict[str, Any]) -> VLMHandler:
