@@ -105,15 +105,11 @@ def create_train_val_test_splits(
     val_indices  = indices[num_test : num_test + num_val]
     train_indices = indices[num_test + num_val:]
 
-    train_dataset = full_dataset.select(train_indices)
-    val_dataset   = full_dataset.select(val_indices)
-    test_dataset  = full_dataset.select(test_indices)
-
     logger.info(
-        f"Split dataset → Train={len(train_dataset)}, "
-        f"Val={len(val_dataset)}, Test={len(test_dataset)}"
+        f"Split dataset → Train={len(train_indices)}, "
+        f"Val={len(val_indices)}, Test={len(test_indices)}"
     )
-    return train_dataset, val_dataset, test_dataset
+    return train_indices, val_indices, test_indices
 
 
 # ────────────────────────────────────────────────────────────────────────────────
