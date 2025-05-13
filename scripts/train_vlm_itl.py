@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import sys
 import math
@@ -53,6 +55,7 @@ from data.pascal_voc import (
     PASCAL_VOC_ID2LABEL,
     PASCAL_VOC_LABEL2ID,
     NUM_PASCAL_VOC_LABELS,
+    PASCAL_VOC_IGNORE_INDEX
 )
 from models.segformer import load_model_for_segmentation
 
@@ -61,6 +64,7 @@ try:
     import wandb
 except ImportError:
     wandb = None
+
 
 
 def calculate_prediction_certainty(
@@ -104,6 +108,10 @@ def calculate_prediction_certainty(
 
 
 def run_vlm_itl_pipeline(config_path: str):
+    # set HF_HOME env variable if not set
+    hf_home = os.getenv("HF_HOME")
+    logging.info(f"HF_HOME: {hf_home}")
+
     logger.info(f"Starting VLM-In-The-Loop pipeline with config: {config_path}")
     config = load_config(config_path)
 
@@ -239,7 +247,7 @@ def run_vlm_itl_pipeline(config_path: str):
         
         # --- 5.A. Prepare Training Data for Current Iteration ---
         if unlabeled_indices and current_model is not None:
-            k = 50
+            k = 100
             if general_config["active_learning"]["sampling_strategy"] == "mock":
                 uncertainties, segmentations = mock_compute_image_uncertainties(
                     model=current_model,
@@ -268,6 +276,31 @@ def run_vlm_itl_pipeline(config_path: str):
                 # reverse=True, 
             )[:k]
 
+            # # Modify segmentations for new_indicies to keep only the dominant class
+            # for idx_to_modify in new_indicies:
+                    
+            #     current_mask_np = segmentations[idx_to_modify]
+            #     unique_classes, counts = np.unique(current_mask_np, return_counts=True)
+                
+            #     dominant_class_id = -1
+            #     max_count = -1
+            #     logger.info(f"Unique classes in mask {idx_to_modify}: {unique_classes}, counts: {counts}")
+            #     # Find the dominant foreground class
+            #     for class_id, count in zip(unique_classes, counts):
+            #         if class_id == PASCAL_VOC_IGNORE_INDEX or class_id == 0: # Ignore index or background
+            #             continue
+            #         if count > max_count:
+            #             max_count = count
+            #             dominant_class_id = class_id
+                
+            #     # Create new mask: fill with background (0), then add only dominant class pixels
+            #     new_mask_np = np.full(current_mask_np.shape, 0, dtype=current_mask_np.dtype) 
+            #     if dominant_class_id != -1: # If a dominant foreground class was found
+            #         new_mask_np[current_mask_np == dominant_class_id] = dominant_class_id
+
+            #     segmentations[idx_to_modify] = new_mask_np
+            # logger.info(f"Processed {len(new_indicies)} masks to keep only dominant foreground class.")
+
             good_indices = []
             bad_indices  = []
 
@@ -278,9 +311,12 @@ def run_vlm_itl_pipeline(config_path: str):
                 vlm_feed_back = vlm_handler.ask_binary_question(
                     image = original_image,
                     segmentation_mask = segmentation_mask,
-                    prompt=vlm_config["vlm_query_template"]
+                    prompt=vlm_config["vlm_query_template"],
+                    idx=f"{iteration}_{idx}",
                 )
+
                 if vlm_feed_back:
+                    logger.info(f"Dominant class ID: {np.unique(segmentations[idx])}, VLM feedback: {vlm_feed_back}, {idx}")
                     good_indices.append(idx)
                 else:
                     bad_indices.append(idx)
@@ -288,8 +324,21 @@ def run_vlm_itl_pipeline(config_path: str):
 
             def _override_mask(example, example_idx):
                 if example_idx in good_indices:
-                    # turn the H×W numpy array into a list of lists
-                    return {"labels": segmentations[example_idx].tolist()}
+                    predicted_mask_np = segmentations[example_idx]
+                    
+                    # Convert to PIL Image
+                    pil_mask = Image.fromarray(predicted_mask_np.astype(np.uint8))
+                    
+                    # Resize to the target size used by the image_processor for labels
+                    # image_processor.size is a dict like {'height': H, 'width': W}
+                    # PIL resize takes (width, height)
+                    resized_pil_mask = pil_mask.resize(
+                        (image_processor.size["width"], image_processor.size["height"]),
+                        resample=Image.NEAREST # Use NEAREST for segmentation masks
+                    )
+                    resized_mask_np = np.array(resized_pil_mask)
+                    
+                    return {"labels": resized_mask_np.tolist()}
                 else:
                     # return no change
                     return {}
@@ -323,7 +372,7 @@ def run_vlm_itl_pipeline(config_path: str):
 
         iter_training_args = TrainingArguments(
             output_dir=iter_training_args_output_dir,
-            num_train_epochs=training_config.get('num_train_epochs_per_iter', 3),
+            num_train_epochs=training_config.get('num_train_epochs', 3),
             per_device_train_batch_size=training_config['per_device_train_batch_size'],
             per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
             save_strategy=training_config.get("save_strategy_per_iter", "epoch"),
@@ -381,7 +430,7 @@ def run_vlm_itl_pipeline(config_path: str):
         logger.info("-"*50)
         logger.info(f"End of VLM Iteration {iteration + 1}:")
         logger.info(f"  Original GT Labeled samples count: {len(current_gt_labeled_indices)}")
-        logger.info(f"  VLM-confirmed pseudo-labeled samples count: {len(pseudo_labels_for_indices)}")
+        logger.info(f"  VLM-confirmed pseudo-labeled samples count: {len(current_training_indices)}")
         logger.info(f"  Unlabeled samples remaining for query: {len(unlabeled_indices)}")
         if general_config.get('wandb_enabled', False) and wandb:
             wandb.log({
