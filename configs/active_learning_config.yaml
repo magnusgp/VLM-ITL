@@ -2,7 +2,7 @@ project_name: "pascal-voc-segmentation"
 run_name_prefix: "AL-b4-BD" # Run name will be appended with iteration info
 output_dir_prefix: "./results/active_learning" # Output dir will be appended
 seed: 42
-log_with: "wandb"
+log_with: "none"
 debug: False # Set to True for debugging purposes
 
 dataset:
@@ -46,4 +46,5 @@ active_learning:
   initial_percentage: 0.2 # Start with 20% of training data
   increment_percentage: 0.2 # Add 20% each iteration
   max_percentage: 1.0 # Go up to 100%
-  sampling_strategy: "bald_diversity" # Sampling strategy for active learning (random, lc (least confidence), bald_diversity (BALD-MC + k-center greedy sampling))
+  sampling_strategy: "min_entropy" # Options: "random", "min_entropy", "max_entropy"
+  iou_threshold: 0.5 # for entropy sampling

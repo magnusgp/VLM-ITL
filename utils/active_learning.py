@@ -28,6 +28,10 @@ def compute_mean_iou(true_mask: np.ndarray, pred_mask: np.ndarray, num_classes: 
     Compute the mean per-class IoU between two H×W integer masks.
     Classes with no pixels in both true and pred are ignored.
     """
+    # check if the masks are the same shape, if not, upsample the pred_mask
+    if true_mask.shape != pred_mask.shape:
+        pred_mask = np.array(Image.fromarray(pred_mask.astype(np.uint8)).resize(true_mask.shape[::-1], Image.NEAREST))
+    
     t = true_mask.flatten()
     p = pred_mask.flatten()
     if num_classes is None:
@@ -63,6 +67,9 @@ def compute_image_uncertainties(
 
     # 2) collate_fn: turn PIL→tensor via preprocess_fn
     def collate_fn(batch):
+        logger.info(f"Collating batch of size {len(batch)}")
+        logger.info(type(batch))
+        logger.info(batch[0])
         imgs = [item['image'] for item in batch]
         msks = [item['mask'] for item in batch]
         proc = preprocess_fn({'image': imgs, 'mask': msks})
@@ -75,7 +82,7 @@ def compute_image_uncertainties(
         raw_subset, 
         batch_size=batch_size, 
         shuffle=False, 
-        collate_fn=collate_fn
+        # collate_fn=collate_fn
     )
     uncertainties: Dict[int, float] = {}
     model_segmentations: Dict[int, np.ndarray] = {}

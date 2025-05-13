@@ -172,7 +172,11 @@ def run_active_learning_pipeline(config_path: str):
 
             # Pick top-k by descending entropy
             new_indices = sorted(
-                uncertainties, key=lambda idx: uncertainties[idx], reverse=True
+                uncertainties, 
+                key=lambda idx: uncertainties[idx], 
+                reverse=False if al_config.get("min_entropy", False) else True,
+                # sort by ascending entropy instead for min_entropy
+                # reverse=True, 
             )[:k]
 
             # 1) Threshold the IoU
@@ -181,7 +185,7 @@ def run_active_learning_pipeline(config_path: str):
             bad_indices  = []
 
             for idx in new_indices:
-                true_mask = full_dataset_dict["train"][idx]["mask"]           # numpy array of shape [H,W]
+                true_mask = full_dataset_dict["train"][idx]["labels"]           # numpy array of shape [H,W]
                 pred_mask = segmentations[idx]                          # your model’s numpy [H,W]
                 miou = compute_mean_iou(true_mask, pred_mask)
                 logger.info(f"  idx={idx}  mean IoU = {miou:.3f}")
@@ -195,7 +199,8 @@ def run_active_learning_pipeline(config_path: str):
             # 2)  Override the true masks *in place* for just those good examples:
             def _override_mask(example, example_idx):
                 if example_idx in good_indices:
-                    return {"mask": segmentations[example_idx]}
+                    # turn the H×W numpy array into a list of lists
+                    return {"labels": segmentations[example_idx].tolist()}
                 else:
                     # return no change
                     return {}
@@ -270,7 +275,7 @@ def run_active_learning_pipeline(config_path: str):
             weight_decay=float(config['training']['weight_decay']),
 
             # strings
-            evaluation_strategy=str(config['training']['evaluation_strategy']),
+            eval_strategy=str(config['training']['evaluation_strategy']),
             save_strategy=str(config['training']['save_strategy']),
             metric_for_best_model=str(config['training']['metric_for_best_model']),
 
