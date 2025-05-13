@@ -288,14 +288,25 @@ def run_vlm_itl_pipeline(config_path: str):
 
             def _override_mask(example, example_idx):
                 if example_idx in good_indices:
-                    # turn the H×W numpy array into a list of lists
-                    return {"labels": segmentations[example_idx].tolist()}
+                    predicted_mask_np = segmentations[example_idx]
+                    
+                    # Convert to PIL Image
+                    pil_mask = Image.fromarray(predicted_mask_np.astype(np.uint8))
+                    
+                    # Resize to the target size used by the image_processor for labels
+                    # image_processor.size is a dict like {'height': H, 'width': W}
+                    # PIL resize takes (width, height)
+                    resized_pil_mask = pil_mask.resize(
+                        (image_processor.size["width"], image_processor.size["height"]),
+                        resample=Image.NEAREST # Use NEAREST for segmentation masks
+                    )
+                    resized_mask_np = np.array(resized_pil_mask)
+                    
+                    return {"labels": resized_mask_np.tolist()}
                 else:
                     # return no change
                     return {}
 
-                # this will go over your entire train split, but only rewrite the
-            # 'mask' for good_indices
             processed_train_pool = processed_train_pool.map(
                 _override_mask,
                 with_indices=True,
@@ -323,11 +334,11 @@ def run_vlm_itl_pipeline(config_path: str):
 
         iter_training_args = TrainingArguments(
             output_dir=iter_training_args_output_dir,
-            num_train_epochs=training_config.get('num_train_epochs_per_iter', 3),
+            num_train_epochs=training_config.get('num_train_epochs_per_iter', 20),
             per_device_train_batch_size=training_config['per_device_train_batch_size'],
             per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
             save_strategy=training_config.get("save_strategy_per_iter", "epoch"),
-            eval_strategy=training_config.get("evaluation_strategy_per_iter", "epoch"),
+            evaluation_strategy=training_config.get("evaluation_strategy_per_iter", "epoch"),
             logging_steps=training_config.get('logging_steps', 50),
             learning_rate=training_config.get('learning_rate_per_iter', 5e-5),
             weight_decay=training_config.get('weight_decay', 0.01),

@@ -35,6 +35,8 @@ MANIFEST
 *.manifest
 *.spec
 
+hub/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -152,3 +154,11 @@ wandb/
 outputs/
 results/
 logs/
+datasets/_home_shadeform_VLM-ITL_datasets_nateraw___pascal-voc-2012_default_0.0.0_65505efaf0a3c4afe512dfc27c3abe2eac397bf9.lock
+.gitignore
+datasets/nateraw___pascal-voc-2012/default/0.0.0/65505efaf0a3c4afe512dfc27c3abe2eac397bf9_builder.lock
+datasets/nateraw___pascal-voc-2012/default/0.0.0/65505efaf0a3c4afe512dfc27c3abe2eac397bf9.incomplete_info.lock
+datasets/nateraw___pascal-voc-2012/default/0.0.0/65505efaf0a3c4afe512dfc27c3abe2eac397bf9/dataset_info.json
+datasets/nateraw___pascal-voc-2012/default/0.0.0/65505efaf0a3c4afe512dfc27c3abe2eac397bf9/pascal-voc-2012-train.arrow
+datasets/nateraw___pascal-voc-2012/default/0.0.0/65505efaf0a3c4afe512dfc27c3abe2eac397bf9/pascal-voc-2012-val.arrow
+datasets/nateraw___pascal-voc-2012/default/0.0.0/65505efaf0a3c4afe512dfc27c3abe2eac397bf9/tmp8twyw1n7

@@ -261,7 +261,7 @@ def main(config_path: str):
         per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
         learning_rate=float(config['training']['learning_rate']),
         weight_decay=float(config['training']['weight_decay']),
-        eval_strategy=config['training']['evaluation_strategy'],
+        evaluation_strategy=config['training']['evaluation_strategy'],
         save_strategy=config['training']['save_strategy'],
         save_total_limit=int(config['training']['save_total_limit']),
         load_best_model_at_end=config['training']['load_best_model_at_end'],

@@ -15,7 +15,7 @@ dataset:
   load_from_cache_file: True # Set to True to use cached dataset
 
 model:
-  name: "nvidia/segformer-b0-finetuned-ade-512-512"
+  name: "nvidia/segformer-b4-finetuned-ade-512-512"
   num_labels: 21
   ignore_mismatched_sizes: True
 
@@ -30,14 +30,14 @@ training: # Params per Active Learning Iteration
   save_total_limit: 1 # Only keep the best from the current iteration
   load_best_model_at_end: True
   metric_for_best_model: "mean_iou"
-  logging_steps: 20
+  logging_steps: 50
   remove_unused_columns: False
   fp16: True
   push_to_hub: False
 
 active_learning:
-  initial_percentage: 0.3 # Start with 20% of training data
-  increment_percentage: 0.05 # Add 5% each iteration
+  initial_percentage: 0.2 # Start with 20% of training data
+  increment_percentage: 0.20 # Add 5% each iteration
   max_percentage: 1.0 # Go up to 100%
   sampling_strategy: "un" # Could be extended (e.g., "uncertainty")
 

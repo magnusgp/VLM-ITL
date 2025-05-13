@@ -275,7 +275,7 @@ def run_active_learning_pipeline(config_path: str):
             weight_decay=float(config['training']['weight_decay']),
 
             # strings
-            eval_strategy=str(config['training']['evaluation_strategy']),
+            evaluation_strategy=str(config['training']['evaluation_strategy']),
             save_strategy=str(config['training']['save_strategy']),
             metric_for_best_model=str(config['training']['metric_for_best_model']),
 
