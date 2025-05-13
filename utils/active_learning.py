@@ -87,7 +87,14 @@ def compute_image_uncertainties(
     uncertainties: Dict[int, float] = {}
     model_segmentations: Dict[int, np.ndarray] = {}
     with torch.no_grad():
-        for batch in tqdm(dl, desc="Computing uncertainties", total=len(dl)):
+        iii=0
+        #for batch in tqdm(dl, desc="Computing uncertainties", total=len(dl)):
+        for batch in dl:
+            logging.info(f"Processing batch {iii}")
+            if iii > 10:
+                return uncertainties, model_segmentations
+            iii += 1
+
             pix       = batch["pixel_values"].to(device)   # [B,3,H,W]
             orig_idxs = batch["__orig_idx__"].tolist()     # [B]
             logits    = model(pix).logits                  # [B,C,H,W]
@@ -104,6 +111,40 @@ def compute_image_uncertainties(
                 # grab the argmax mask and move it to CPU + numpy
                 seg_mask = logits[i].argmax(dim=0).cpu().numpy()  # [H,W]
                 model_segmentations[orig_idx] = seg_mask
+    return uncertainties, model_segmentations
+
+def mock_compute_image_uncertainties(
+    model, # Mocked, not used
+    dataset, # Mocked, not used
+    remaining_indices: List[int],
+    preprocess_fn, # Mocked, not used
+    device, # Mocked, not used
+    batch_size: int = 8 # Mocked, not used
+) -> Tuple[Dict[int, float], Dict[int, np.ndarray]]:
+    """
+    Mock version of compute_image_uncertainties.
+    Returns dummy uncertainties and model segmentations.
+    """
+    logger.info(f"Called mock_compute_image_uncertainties for {len(remaining_indices)} indices.")
+    uncertainties: Dict[int, float] = {}
+    model_segmentations: Dict[int, np.ndarray] = {}
+
+    # Generate dummy data
+    for idx in remaining_indices:
+        # Dummy uncertainty: random float between 0 and 1
+        uncertainties[idx] = random.random()
+
+        # Dummy segmentation: a 10x10 numpy array with random integers (0 or 1)
+        # You might want to adjust the shape or content based on your actual data
+        # Create a dummy segmentation with a square in the middle
+        dummy_segmentation = np.zeros((512, 512), dtype=np.uint8)
+        square_size = 128
+        start = (512 - square_size) // 2
+        end = start + square_size
+        dummy_segmentation[start:end, start:end] = 1
+        model_segmentations[idx] = dummy_segmentation
+    logger.info(f"Generated mock uncertainties for keys: {list(uncertainties.keys())[:5]}...")
+    logger.info(f"Generated mock segmentations for keys: {list(model_segmentations.keys())[:5]}...")
 
     return uncertainties, model_segmentations
 

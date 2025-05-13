@@ -1,8 +1,12 @@
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 from PIL import Image
 import random
-import logging
+import torch
+import numpy as np
+import os # Added for path operations
+from data.pascal_voc import PASCAL_VOC_COLORS, PASCAL_VOC_IGNORE_INDEX
 
 logger = logging.getLogger(__name__)
 
@@ -179,18 +183,22 @@ class MockVLMHandler(VLMHandler):
         }
 
 class HuggingFaceVLMHandler(VLMHandler):
+    save_vlm_debug_images = True # Class variable to control debug image saving
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
-        self.pipeline = None
+        # self.pipeline = None
 
     def _load_model(self):
         try:
             from transformers import pipeline # Ensure pipeline is imported here
             model_name = self.config.get("vlm_model_name", "Salesforce/blip-vqa-base") # Example
+            from transformers import BlipProcessor, BlipForQuestionAnswering
+
             task = "visual-question-answering"
             logger.info(f"Loading VLM pipeline: {model_name} for task: {task}")
+            self.processor = BlipProcessor.from_pretrained(model_name)
+            self.model = BlipForQuestionAnswering.from_pretrained(model_name).to("cuda" if torch.cuda.is_available() else "cpu")
             # Note: May need specific device placement (e.g., device=0 for GPU)
-            self.pipeline = pipeline(task, model=model_name)
             logger.info("VLM pipeline loaded successfully.")
         except ImportError:
             logger.error("transformers library not installed or failed to import pipeline. Install with `pip install transformers`")
@@ -205,9 +213,115 @@ class HuggingFaceVLMHandler(VLMHandler):
         segmentation_mask: Optional[Image.Image], # VQA pipelines might not use the mask directly
         prompt: str
     ) -> bool:
-        if self.pipeline is None:
-             logger.error("VLM pipeline not initialized.")
-             raise RuntimeError("VLM pipeline not available.")
+        visual_input_image = image
+        processed_segmentation_mask_pil = None # To store the mask that is used for overlay
+
+        if segmentation_mask:
+            try:
+                # Ensure image is RGBA for alpha compositing
+                base_image_rgba = image.convert("RGBA")
+                current_segmentation_mask_pil = segmentation_mask # Keep a reference to the mask being processed
+
+                # Resize mask to image size if necessary
+                if image.size != current_segmentation_mask_pil.size:
+                    logger.warning(
+                        f"Image size {image.size} and mask size {current_segmentation_mask_pil.size} differ. "
+                        f"Resizing mask to image size using NEAREST."
+                    )
+                    current_segmentation_mask_pil = current_segmentation_mask_pil.resize(image.size, Image.NEAREST)
+                
+                processed_segmentation_mask_pil = current_segmentation_mask_pil # This is the mask used for overlay
+                mask_np = np.array(processed_segmentation_mask_pil.convert('L')) # Ensure L mode for class indices
+
+                # Create a transparent overlay layer (H, W, 4 for RGBA)
+                highlight_layer_np = np.zeros((image.size[1], image.size[0], 4), dtype=np.uint8)
+                highlight_alpha = 128 # Semi-transparent
+
+                unique_classes = np.unique(mask_np)
+                for class_idx_val in unique_classes:
+                    if class_idx_val == PASCAL_VOC_IGNORE_INDEX or class_idx_val == 0: # Ignore background (0) or ignore_index
+                        continue
+                    
+                    # Check if class_idx is valid for PASCAL_VOC_COLORS
+                    if 0 < class_idx_val < len(PASCAL_VOC_COLORS):
+                        color_rgb = PASCAL_VOC_COLORS[class_idx_val]
+                        color_rgba = (*color_rgb, highlight_alpha)
+                        
+                        # Find pixels belonging to this class
+                        class_pixels_mask = (mask_np == class_idx_val) # HxW boolean mask
+                        highlight_layer_np[class_pixels_mask] = color_rgba
+                    else:
+                        logger.warning(f"Mask contains class index {class_idx_val} out of range for PASCAL_VOC_COLORS. Skipping.")
+
+
+                highlight_layer_pil = Image.fromarray(highlight_layer_np, "RGBA")
+                
+                # Alpha composite the highlight layer onto the base image
+                composited_image = Image.alpha_composite(base_image_rgba, highlight_layer_pil)
+                visual_input_image = composited_image.convert("RGB") # Convert back to RGB
+                
+                # For debugging - save the image
+                #visual_input_image.save("vlm_debug_overlayed_input.png")
+
+            except Exception as e:
+                logger.error(f"Error creating overlay for segmentation mask: {e}", exc_info=True)
+                # Fallback to using the original image if overlay fails
+                visual_input_image = image
+        
+        # Save debug images if flag is set
+        if self.config.get("save_vlm_debug_images", False) and segmentation_mask:
+            debug_dir = "vlm_debug_output"
+            os.makedirs(debug_dir, exist_ok=True)
+            img_suffix = random.randint(10000, 99999)
+            try:
+                # Ensure all images are in RGB for consistent handling
+                original_rgb = image.convert("RGB")
+                
+                # Create colorized mask
+                colorized_mask_pil = None
+                if processed_segmentation_mask_pil:
+                    mask_for_colorizing_np = np.array(processed_segmentation_mask_pil.convert('L'))
+                    rgb_mask_np = np.zeros((mask_for_colorizing_np.shape[0], mask_for_colorizing_np.shape[1], 3), dtype=np.uint8)
+                    for class_idx_val, color in enumerate(PASCAL_VOC_COLORS):
+                        if class_idx_val == PASCAL_VOC_IGNORE_INDEX: # Should not happen if mask is clean
+                            continue
+                        rgb_mask_np[mask_for_colorizing_np == class_idx_val] = color
+                    colorized_mask_pil = Image.fromarray(rgb_mask_np, "RGB")
+
+                # visual_input_image is already the overlaid image (or original if overlay failed)
+                overlaid_rgb = visual_input_image.convert("RGB")
+
+                images_to_combine = [original_rgb]
+                if colorized_mask_pil:
+                    images_to_combine.append(colorized_mask_pil)
+                else: # Add a placeholder if mask processing failed for colorization
+                    placeholder = Image.new("RGB", original_rgb.size, "gray")
+                    images_to_combine.append(placeholder)
+                images_to_combine.append(overlaid_rgb)
+
+                # Assuming all images are resized to the same dimensions (original_rgb.size)
+                # or that visual_input_image and processed_segmentation_mask_pil were resized to image.size
+                widths, heights = zip(*(i.size for i in images_to_combine))
+                
+                total_width = sum(widths)
+                max_height = max(heights)
+
+                composite_image = Image.new('RGB', (total_width, max_height))
+                
+                x_offset = 0
+                for img_to_paste in images_to_combine:
+                    # Resize if necessary to fit max_height, maintaining aspect ratio (optional, but good for consistency)
+                    # For simplicity, this example assumes they are already compatible or pasting at (0,0) in their slot is fine.
+                    # If they have different heights, they will be top-aligned.
+                    composite_image.paste(img_to_paste, (x_offset, 0))
+                    x_offset += img_to_paste.size[0]
+                
+                composite_image_path = os.path.join(debug_dir, f"composite_debug_{img_suffix}.png")
+                composite_image.save(composite_image_path)
+                logger.info(f"Saved composite VLM debug image to {composite_image_path}")
+
+            except Exception as e:
+                logger.error(f"Failed to save VLM composite debug image: {e}", exc_info=True)
 
         try:
             # Ensure prompt clearly asks a yes/no question
@@ -219,15 +333,18 @@ class HuggingFaceVLMHandler(VLMHandler):
             # For most VQA pipelines, only the image and question are standard inputs.
             # If the segmentation_mask is meant to be part of the visual input,
             # it would typically need to be overlaid on the image before this call.
-            result = self.pipeline(image, question=prompt, top_k=1) # Get the top answer
-
+        
+            # Use visual_input_image which might be the original or overlaid image
+            inputs = self.processor(visual_input_image, prompt, return_tensors="pt").to(self.model.device)
+            answer_tokens = self.model.generate(**inputs) # Get the top answer
+            result = self.processor.decode(answer_tokens[0], skip_special_tokens=True)
             # Process the result to get a boolean answer
-            if not result or not isinstance(result, list) or not result[0] or 'answer' not in result[0]:
+            if not result or not isinstance(result, str):
                 logger.error(f"VLM returned an unexpected result format for prompt '{prompt}'. Result: {result}")
                 return False # Fallback for unexpected format
             
-            answer_text = result[0]['answer'].lower().strip()
-            logger.debug(f"VLM raw answer for '{prompt}': {answer_text}")
+            answer_text = result.lower().strip()
+            logger.info(f"VLM raw answer for '{prompt}': {answer_text}")
 
             # Simple yes/no parsing
             if answer_text.startswith("yes"):
@@ -254,7 +371,7 @@ def get_vlm_handler(config: Dict[str, Any]) -> VLMHandler:
         logger.info("Creating HuggingFaceVLMHandler (BLIP).")
         # Ensure necessary options like model name are passed if needed
         vlm_options["vlm_model_name"] = vlm_options.get("vlm_model_name", "Salesforce/blip-vqa-base")
-        return HuggingFaceVLMHandler(vlm_options)
+        return HuggingFaceVLMHandler(config)
     else:
         raise ValueError(f"Unsupported VLM handler type: {vlm_type}")
 

@@ -12,7 +12,7 @@ dataset:
   mask_col: "mask"
   val_split_percentage: 0.1 # Use 10% of train as validation (fixed across iterations)
   test_split_percentage: 0.1 # Use 10% of train as test (fixed across iterations)
-  load_from_cache_file: False # Set to True to use cached dataset
+  load_from_cache_file: True # Set to True to use cached dataset
 
 model:
   name: "nvidia/segformer-b0-finetuned-ade-512-512"
@@ -39,12 +39,15 @@ active_learning:
   initial_percentage: 0.3 # Start with 20% of training data
   increment_percentage: 0.05 # Add 5% each iteration
   max_percentage: 1.0 # Go up to 100%
-  sampling_strategy: "bald_diversity" # Could be extended (e.g., "uncertainty")
+  sampling_strategy: "un" # Could be extended (e.g., "uncertainty")
 
 vlm_itl: # Configuration for the VLM-ITL run (can be in the same file or separate)
   enabled: True # Set to True for the VLM-ITL script
   run_name_prefix: "vlm-itl-segformer-b4"
   output_dir_prefix: "./results/vlm_itl"
-  vlm_handler: "huggingface_blip" # Type of VLM handler ('mock', 'huggingface_blip', etc.)
-  vlm_query_template: "Is the primary object in this segmented region correctly identified as {label_name}?"
+  vlm_handler:
+    vlm_type: "huggingface_blip" # Type of VLM handler ('mock', 'huggingface_blip', etc.)
+    vlm_model_name: "Salesforce/blip-vqa-base" # Type of VLM handler ('mock', 'huggingface_blip', etc.)
+    save_vlm_debug_images: True # Save debug images for VLM
+  vlm_query_template: "Is the primary object/objects correctly segmented?"
   eval_subset_size: 0 # skip evaluation for now
