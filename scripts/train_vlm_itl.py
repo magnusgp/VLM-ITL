@@ -38,6 +38,47 @@ from data.pascal_voc import (
 )
 from models.segformer import load_model_for_segmentation
 
+# Add a custom Trainer class for explicit loss handling
+class SegmentationTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """
+        How the loss is computed by Trainer. By default, all models return a tuple checking if labels were provided or not.
+        We override this to explicitly pass labels AND retrieve the loss.
+        """
+        # Extract labels so we can pass them in the forward pass
+        labels = inputs.pop("labels", None)
+        pixel_values = inputs.get("pixel_values")
+
+        if labels is None:
+            logger.warning("No labels provided in inputs. Loss cannot be computed.")
+            raise ValueError("Labels must be provided in inputs to compute loss.")
+        if pixel_values is None:
+            logger.warning("No pixel values provided in inputs. Loss cannot be computed.")
+            raise ValueError("Both 'pixel_values' and 'labels' must be in inputs to compute loss.")
+        
+        # Ensure labels are 3D: [batch_size, height, width]
+        # The cross_entropy loss expects targets without the channel dimension
+        if labels.dim() == 4 and labels.shape[1] == 1:
+            labels = labels.squeeze(1)
+        elif labels.dim() != 3:
+             # Add a check for other unexpected shapes
+             logger.error(f"Unexpected labels tensor shape: {labels.shape}. Expected 3D [B, H, W] or 4D [B, 1, H, W].")
+             raise ValueError(f"Unexpected labels tensor shape: {labels.shape}")
+        
+        # Forward pass with explicit labels
+        outputs = model(pixel_values=pixel_values, labels=labels)
+
+        if hasattr(outputs, 'loss') and outputs.loss is not None:
+            loss = outputs.loss
+        else:
+            logger.warning("Model output did not contain 'loss' attribute despite labels being provided.")
+            if isinstance(outputs, dict) and "loss" in outputs:
+                loss = outputs["loss"]
+            else:
+                raise ValueError("Could not retrieve loss from model output.")
+
+        return (loss, outputs) if return_outputs else loss
+
 # Helper function to convert various mask types to numpy arrays
 def ensure_mask_as_numpy(mask_data) -> np.ndarray:
     """
@@ -180,7 +221,8 @@ def run_vlm_itl_pipeline(config_path: str):
     
     image_processor = SegformerImageProcessor.from_pretrained(
         dataset_config['feature_extractor_name'],
-        do_reduce_labels=False # Explicitly set to False to let preprocess_data handle label mapping
+        do_reduce_labels=False,
+        do_resize=True # Explicitly set to False to let preprocess_data handle label mapping
     )
     # image_processor.do_normalize = model_config.get('do_normalize', True)
     # image_processor.image_mean = model_config.get('image_mean', [0.485, 0.456, 0.406])
@@ -235,16 +277,16 @@ def run_vlm_itl_pipeline(config_path: str):
         batched=True, 
         remove_columns=val_dataset.column_names,
         batch_size=training_config.get('per_device_eval_batch_size', 8),
-        load_from_cache_file=True # Force reprocessing if needed
+        load_from_cache_file=False # Force reprocessing if needed
     )
-    processed_val_dataset.set_format("torch")
+    processed_val_dataset.set_format("torch", columns=["pixel_values", "labels"])
     logger.info("Preprocessing test dataset...")
     processed_test_dataset = test_dataset.map(
         shared_preprocess_fn, 
         batched=True, 
         remove_columns=test_dataset.column_names,
         batch_size=training_config.get('per_device_eval_batch_size', 8),
-        load_from_cache_file=True # Force reprocessing if needed
+        load_from_cache_file=False # Force reprocessing if needed
     )
     processed_test_dataset.set_format("torch")
     
@@ -255,7 +297,7 @@ def run_vlm_itl_pipeline(config_path: str):
         batched=True,
         remove_columns=full_train_data.column_names,
         batch_size=training_config.get('per_device_train_batch_size', 8),
-        load_from_cache_file=True # Force reprocessing if needed
+        load_from_cache_file=False # Force reprocessing if needed
     )
     processed_full_train_data.set_format("torch")
     logger.info(f"Processed full training data size: {len(processed_full_train_data)}")
@@ -339,11 +381,12 @@ def run_vlm_itl_pipeline(config_path: str):
             shared_preprocess_fn,
             batched=True,
             batch_size=training_config.get('per_device_train_batch_size', 8),
-            remove_columns=combined_dataset_raw.column_names
+            remove_columns=combined_dataset_raw.column_names,
+            load_from_cache_file=False # Force reprocessing to avoid cache issues
         )
         
         # 5. Set the torch format for the processed dataset
-        processed_iter_train_dataset.set_format("torch")
+        processed_iter_train_dataset.set_format("torch", columns=["pixel_values", "labels"])
         logger.info(f"Final processed training dataset for iteration {iteration+1}: {len(processed_iter_train_dataset)} samples")
 
         # --- 5.B. Train Segmentation Model ---
@@ -353,7 +396,8 @@ def run_vlm_itl_pipeline(config_path: str):
             id2label=PASCAL_VOC_ID2LABEL,
             label2id=PASCAL_VOC_LABEL2ID,
             ignore_mismatched_sizes=model_config.get('ignore_mismatched_sizes', True)
-        ).to(device)
+        )
+        model = model.to(device)  # Ensure model is explicitly moved to device
 
         # Adjust epochs per VLM iteration if needed
         num_train_epochs_this_iter = training_config.get('num_epochs_per_vlm_iter', training_config.get('num_epochs', 3))
@@ -376,7 +420,7 @@ def run_vlm_itl_pipeline(config_path: str):
             report_to="wandb" if general_config.get('wandb_enabled', False) else "none",
         )
 
-        trainer = Trainer(
+        trainer = SegmentationTrainer(
             model=model,
             args=training_args,
             train_dataset=processed_iter_train_dataset if len(processed_iter_train_dataset) > 0 else None,
