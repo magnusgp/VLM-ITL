@@ -2,16 +2,15 @@ import os
 import sys
 import math
 import random
-import numpy as np
-import torch
+import json
+import logging # Ensure logging is imported at the top level
 from functools import partial
-from tqdm import tqdm
-from PIL import Image
-from typing import List, Dict, Any, Tuple, Callable, Optional, Iterator
+from typing import Dict, Any, List, Optional # Ensure Optional and List are imported
 
-# Add project root to Python path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, project_root)
+from PIL import Image
+import torch
+import numpy as np
+from tqdm.auto import tqdm # Added for progress bars
 
 from transformers import (
     TrainingArguments,
@@ -20,126 +19,48 @@ from transformers import (
     set_seed,
     EarlyStoppingCallback
 )
-# Use HFDataset for the new approach
-from datasets import Dataset as HFDataset, Features
-from datasets import Image as HFImageField # For specifying features
+from datasets import Dataset, DatasetDict, concatenate_datasets # Ensure Dataset, DatasetDict, concatenate_datasets are imported
+
+# Add project root to Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from utils.config import load_config
-from utils.log_utils import setup_wandb, logger
+from utils.log_utils import (
+    setup_wandb, 
+    logger, 
+    # log_active_learning_summary, # Not used here
+    # debug_log_and_plot # Not used here
+)
 from utils.metrics import compute_metrics_segmentation
-from utils.vlm import get_vlm_handler, VLMHandler
+from utils.vlm import get_vlm_handler # Assuming this is where VLM handlers are defined
+from utils.active_learning import ( # For SegmentationImageLoggerCallbackVLM if used
+    # sample_initial_data, 
+    # select_next_batch_indices,
+    # feature_extractor_fn,
+    # ActiveLearningProgressCallback, 
+    SegmentationImageLoggerCallback, # Or a VLM specific version
+    # compute_image_uncertainties,
+    # compute_mean_iou
+)
 from data.pascal_voc import (
     load_pascal_voc_dataset,
     preprocess_data,
-    create_train_val_test_splits,
+    create_train_val_test_splits, 
+    PASCAL_VOC_LABEL_NAMES,
     PASCAL_VOC_ID2LABEL,
     PASCAL_VOC_LABEL2ID,
-    NUM_PASCAL_VOC_LABELS
+    NUM_PASCAL_VOC_LABELS,
+    ensure_mask_as_numpy # Make sure this utility is available if used
 )
 from models.segformer import load_model_for_segmentation
 
-# Add a custom Trainer class for explicit loss handling
-class SegmentationTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """
-        How the loss is computed by Trainer. By default, all models return a tuple checking if labels were provided or not.
-        We override this to explicitly pass labels AND retrieve the loss.
-        """
-        # Extract labels so we can pass them in the forward pass
-        labels = inputs.pop("labels", None)
-        pixel_values = inputs.get("pixel_values")
-
-        if labels is None:
-            logger.warning("No labels provided in inputs. Loss cannot be computed.")
-            raise ValueError("Labels must be provided in inputs to compute loss.")
-        if pixel_values is None:
-            logger.warning("No pixel values provided in inputs. Loss cannot be computed.")
-            raise ValueError("Both 'pixel_values' and 'labels' must be in inputs to compute loss.")
-        
-        # Ensure labels are 3D: [batch_size, height, width]
-        # The cross_entropy loss expects targets without the channel dimension
-        if labels.dim() == 4 and labels.shape[1] == 1:
-            labels = labels.squeeze(1)
-        elif labels.dim() != 3:
-             # Add a check for other unexpected shapes
-             logger.error(f"Unexpected labels tensor shape: {labels.shape}. Expected 3D [B, H, W] or 4D [B, 1, H, W].")
-             raise ValueError(f"Unexpected labels tensor shape: {labels.shape}")
-        
-        # Forward pass with explicit labels
-        outputs = model(pixel_values=pixel_values, labels=labels)
-
-        if hasattr(outputs, 'loss') and outputs.loss is not None:
-            loss = outputs.loss
-        else:
-            logger.warning("Model output did not contain 'loss' attribute despite labels being provided.")
-            if isinstance(outputs, dict) and "loss" in outputs:
-                loss = outputs["loss"]
-            else:
-                raise ValueError("Could not retrieve loss from model output.")
-
-        return (loss, outputs) if return_outputs else loss
-
-# Helper function to convert various mask types to numpy arrays
-def ensure_mask_as_numpy(mask_data) -> np.ndarray:
-    """
-    Convert mask data to a numpy array regardless of input type.
-    
-    Args:
-        mask_data: Can be a PIL Image, numpy array, or path to an image
-        
-    Returns:
-        np.ndarray: The mask as a numpy array
-    """
-    if isinstance(mask_data, np.ndarray):
-        return mask_data
-    elif isinstance(mask_data, Image.Image):
-        return np.array(mask_data)
-    elif isinstance(mask_data, dict) and 'path' in mask_data:
-        return np.array(Image.open(mask_data['path']).convert('L'))
-    elif isinstance(mask_data, str):
-        return np.array(Image.open(mask_data).convert('L'))
-    else:
-        try:
-            return np.array(mask_data)
-        except Exception as e:
-            logger.error(f"Cannot convert mask to numpy: {e}")
-            return np.zeros((10, 10), dtype=np.uint8)  # Fallback empty mask
-
-def get_dominant_label_and_mask_from_prediction(
-    pred_mask_np: np.ndarray,
-    id2label: Dict[int, str],
-    ignore_labels: List[int] = [0, 255] # Background and ignore index for PASCAL
-) -> Tuple[Optional[str], Optional[Image.Image], Optional[int]]:
-    """
-    Finds the dominant predicted label name, its corresponding binary mask, and its ID.
-    """
-    unique_labels, counts = np.unique(pred_mask_np, return_counts=True)
-    dominant_label_id = -1
-    max_count = -1
-
-    for label_id, count in zip(unique_labels, counts):
-        if label_id in ignore_labels:
-            continue
-        if count > max_count:
-            max_count = count
-            dominant_label_id = int(label_id) # Ensure it's Python int
-
-    if dominant_label_id != -1 and dominant_label_id in id2label :
-        dominant_label_name = id2label.get(dominant_label_id, "unknown")
-        # Create a binary mask for the dominant label (mask values are 0 or dominant_label_id)
-        # For VLM verification, we often care about the region of this dominant class.
-        # The pseudo-label saved should be the full multi-class pred_mask_np if VLM confirms the dominant part.
-        # Or, if VLM confirms "object X is there and segmented well", we save pred_mask_np.
-        # Let's save the original multi-class predicted mask if VLM confirms its dominant aspect.
-        
-        # For the purpose of asking VLM, we might want to give it a binary mask of the dominant object
-        # dominant_object_mask_np = (pred_mask_np == dominant_label_id).astype(np.uint8) * 255 # Binary 0 or 255
-        # dominant_object_mask_pil = Image.fromarray(dominant_object_mask_np, mode='L')
-        # For now, let's assume the VLM can be queried on the whole image + dominant label name,
-        # and the `segmentation_mask` argument to `ask_binary_question` can be the `pred_mask_pil` (multi-class).
-
-        return dominant_label_name, Image.fromarray(pred_mask_np.astype(np.uint8), mode='L'), dominant_label_id
-    return None, None, None
+# Conditional import for wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 def calculate_prediction_certainty(
@@ -152,22 +73,33 @@ def calculate_prediction_certainty(
     Calculates certainty: average max probability for pixels of the dominant predicted class.
     If no dominant class, or dominant class has no pixels, returns 0.
     """
-    if dominant_label_id is None or dominant_label_id == -1:
+    if dominant_label_id is None or dominant_label_id == -1 or dominant_label_id == ignore_index:
         return 0.0
 
-    probs = torch.softmax(logits.squeeze(0), dim=0)  # (NumClasses, H, W)
+    # Ensure logits are on the correct device, matching pred_mask_np if it becomes a tensor
+    # probs = torch.softmax(logits.squeeze(0), dim=0)  # (NumClasses, H, W)
     
+    # For numerical stability with upsampled logits, ensure they are float32
+    probs = torch.softmax(logits.squeeze(0).float(), dim=0)
+
+
     # Probabilities for the dominant class
+    # Ensure dominant_label_id is within bounds
+    if not (0 <= dominant_label_id < probs.shape[0]):
+        logger.warning(f"Dominant label ID {dominant_label_id} is out of bounds for probs shape {probs.shape}. Returning 0 certainty.")
+        return 0.0
     dominant_class_probs = probs[dominant_label_id, :, :] # (H, W)
     
     # Mask for pixels belonging to the dominant class in the prediction
+    # Ensure pred_mask_np is on the same device as dominant_class_probs if it's converted to a tensor
     dominant_class_pixel_mask = torch.from_numpy(pred_mask_np == dominant_label_id).to(dominant_class_probs.device)
     
-    if dominant_class_pixel_mask.sum() == 0:
+    sum_mask = dominant_class_pixel_mask.sum()
+    if sum_mask == 0:
         return 0.0 # No pixels predicted as the dominant class
         
     # Average probability for the dominant class over its predicted pixels
-    certainty = torch.sum(dominant_class_probs * dominant_class_pixel_mask) / torch.sum(dominant_class_pixel_mask)
+    certainty = torch.sum(dominant_class_probs * dominant_class_pixel_mask) / sum_mask
     return certainty.item()
 
 
@@ -191,412 +123,498 @@ def run_vlm_itl_pipeline(config_path: str):
     logger.info(f"Using device: {device}")
     
     output_dir_base = vlm_config.get('output_dir', './results/vlm_itl_runs')
-    run_name = f"{vlm_config.get('run_name_prefix', 'vlm_itl')}_{general_config['seed']}_{random.randint(1000,9999)}"
+    run_name_suffix = random.randint(1000,9999)
+    run_name = f"{vlm_config.get('run_name_prefix', 'vlm_itl')}_{general_config['seed']}_{run_name_suffix}"
     output_dir = os.path.join(output_dir_base, run_name)
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Run output will be saved to: {output_dir}")
 
-    if general_config.get('wandb_enabled', False):
-        setup_wandb(config, run_name, project_suffix="-vlm_itl")
+    if general_config.get('wandb_enabled', False) and wandb:
+        setup_wandb(config, run_name, project_name=general_config.get('project_name', 'VLM-ITL-Project'), project_suffix="-vlm_itl")
+    else:
+        logger.info("W&B logging is disabled.")
+
 
     # --- 2. Initialize VLM Handler (BLIP) ---
     logger.info("Initializing VLM Handler (HuggingFace BLIP)...")
     try:
-        vlm_handler_config = config.copy() # Use a copy to modify for VLM handler init
-        vlm_handler_config['vlm_itl']['vlm_handler'] = 'huggingface_blip' 
-        # Ensure vlm_options for model name if not default, e.g.
-        # vlm_handler_config['vlm_itl'].setdefault('vlm_options', {})['vlm_model_name'] = 'Salesforce/blip-vqa-base'
+        vlm_handler_config = config.copy() 
+        vlm_handler_config['vlm_itl'] = vlm_handler_config.get('vlm_itl', {})
+        vlm_handler_config['vlm_itl']['vlm_handler'] = vlm_config.get('vlm_handler_name', 'huggingface_blip')
         vlm_handler = get_vlm_handler(vlm_handler_config)
     except Exception as e:
         logger.error(f"Failed to initialize VLM Handler: {e}", exc_info=True)
         sys.exit(1)
 
-    # --- 3. Load and Prepare Full Data ---
+    # --- 3. Load Raw Data ---
     logger.info(f"Loading PASCAL VOC dataset: {dataset_config['name']}...")
-    # This should load the full dataset, including images that might be paths
     raw_datasets = load_pascal_voc_dataset(
         dataset_name=dataset_config['name'],
         cache_dir=dataset_config.get('cache_dir') 
     )
     
+    # --- 4. Prepare Image Processor and Preprocessing Function ---
+    logger.info("Loading Image Processor...")
     image_processor = SegformerImageProcessor.from_pretrained(
         dataset_config['feature_extractor_name'],
-        do_reduce_labels=False,
-        do_resize=True # Explicitly set to False to let preprocess_data handle label mapping
+        do_reduce_labels=False 
     )
-    # image_processor.do_normalize = model_config.get('do_normalize', True)
-    # image_processor.image_mean = model_config.get('image_mean', [0.485, 0.456, 0.406])
-    # image_processor.image_std = model_config.get('image_std', [0.229, 0.224, 0.225])
-
-    logger.info("Creating initial data splits...")
-    full_train_data: HFDataset = raw_datasets['train'] # This is an ArrowDataset
-    val_dataset: HFDataset = raw_datasets['test'] # Or derive from train if no val split
-    test_dataset: HFDataset = raw_datasets['test'] # Or derive
-
-    # If val/test are not pre-defined, split them from full_train_data
-    if 'validation' not in raw_datasets or 'test' not in raw_datasets:
-        logger.info("Validation/Test splits not found in raw_datasets. Creating from training data.")
-        full_train_data, val_dataset, test_dataset = create_train_val_test_splits(
-            raw_datasets['train'], 
-            val_percentage=dataset_config.get('val_split_percentage', 0.1),
-            test_percentage=dataset_config.get('test_split_percentage', 0.1),
-            seed=general_config['seed']
-        )
     
-    logger.info(f"Full train data size: {len(full_train_data)}")
-    logger.info(f"Validation data size: {len(val_dataset)}")
-    logger.info(f"Test data size: {len(test_dataset)}")
-
-    initial_train_percentage = vlm_config.get('initial_training_percentage', 0.05) # e.g. 5%
-    num_initial_samples = math.ceil(initial_train_percentage * len(full_train_data))
-    
-    all_train_indices = list(range(len(full_train_data)))
-    random.shuffle(all_train_indices) 
-    
-    # These are indices with respect to `full_train_data`
-    current_gt_labeled_indices = sorted(all_train_indices[:num_initial_samples])
-    unlabeled_indices = sorted(all_train_indices[num_initial_samples:])
-    
-    pseudo_labels_for_indices: Dict[int, Image.Image] = {} 
-
-    logger.info(f"Initial GT labeled set size: {len(current_gt_labeled_indices)}")
-    logger.info(f"Initial unlabeled pool size: {len(unlabeled_indices)}")
-
-    # --- 4. Preprocessing Function ---
     shared_preprocess_fn = partial(
-        preprocess_data, # Your existing function from pascal_voc.py
+        preprocess_data, 
         image_processor=image_processor,
         image_col=dataset_config['image_col'],
         mask_col=dataset_config['mask_col']
     )
     
-    # Preprocess val and test datasets once (they don't change)
-    logger.info("Preprocessing validation dataset...")
-    processed_val_dataset = val_dataset.map(
-        shared_preprocess_fn, 
-        batched=True, 
-        remove_columns=val_dataset.column_names,
-        batch_size=training_config.get('per_device_eval_batch_size', 8),
-        load_from_cache_file=False # Force reprocessing if needed
+    logger.info("Creating fixed validation and test set indices from raw_datasets['train']...")
+    train_indices, val_indices, test_indices = create_train_val_test_splits(
+        raw_datasets['train'], 
+        val_percentage=dataset_config.get('val_split_percentage', 0.1),
+        test_percentage=dataset_config.get('test_split_percentage', 0.1),
+        seed=general_config['seed']
     )
-    processed_val_dataset.set_format("torch", columns=["pixel_values", "labels"])
-    logger.info("Preprocessing test dataset...")
-    processed_test_dataset = test_dataset.map(
-        shared_preprocess_fn, 
-        batched=True, 
-        remove_columns=test_dataset.column_names,
-        batch_size=training_config.get('per_device_eval_batch_size', 8),
-        load_from_cache_file=False # Force reprocessing if needed
-    )
-    processed_test_dataset.set_format("torch")
     
-    # Preprocess the full training data once too - this is important for consistent format
-    logger.info("Preprocessing full training dataset (will be used for predictions)...")
-    processed_full_train_data = full_train_data.map(
+    logger.info("Preprocessing the entirety of raw_datasets['train'] to create a source for train/val/test splits...")
+    preprocessed_source_dataset = raw_datasets['train'].map(
         shared_preprocess_fn,
         batched=True,
-        remove_columns=full_train_data.column_names,
-        batch_size=training_config.get('per_device_train_batch_size', 8),
-        load_from_cache_file=False # Force reprocessing if needed
+        batch_size=training_config.get('per_device_eval_batch_size', 8),
+        remove_columns=[dataset_config['image_col'], dataset_config['mask_col']],
+        load_from_cache_file=general_config.get('load_from_cache_file', True),
+        desc="Preprocessing raw training data"
     )
-    processed_full_train_data.set_format("torch")
-    logger.info(f"Processed full training data size: {len(processed_full_train_data)}")
+    preprocessed_source_dataset.set_format("torch", columns=["pixel_values", "labels"])
+    
+    processed_train_pool = preprocessed_source_dataset.select(train_indices)
+    processed_val_dataset = preprocessed_source_dataset.select(val_indices)
+    processed_test_dataset = preprocessed_source_dataset.select(test_indices)
+    raw_train_data_subset = raw_datasets['train'].select(train_indices)
+    
+    logger.info(f"Processed train pool size: {len(processed_train_pool)}")
+    logger.info(f"Raw train data subset size (for pseudo-labeling source): {len(raw_train_data_subset)}")
+    logger.info(f"Processed validation data size: {len(processed_val_dataset)}")
+    logger.info(f"Processed test data size: {len(processed_test_dataset)}")
 
+    initial_train_percentage = vlm_config.get('initial_training_percentage', 0.05)
+    num_initial_samples = math.ceil(initial_train_percentage * len(processed_train_pool))
+    
+    all_indices_for_train_pool = list(range(len(processed_train_pool)))
+    random.shuffle(all_indices_for_train_pool) 
+    
+    current_gt_labeled_indices = sorted(all_indices_for_train_pool[:num_initial_samples])
+    unlabeled_indices = sorted(all_indices_for_train_pool[num_initial_samples:])
+    pseudo_labels_for_indices: Dict[int, Image.Image] = {} 
+
+    logger.info(f"Initial GT labeled set size (from processed pool): {len(current_gt_labeled_indices)}")
+    logger.info(f"Initial unlabeled pool size (from processed pool): {len(unlabeled_indices)}")
 
     # --- 5. VLM Iteration Loop ---
     num_vlm_iterations = vlm_config.get('num_vlm_iterations', 5)
     samples_to_evaluate_certainty_per_iter = vlm_config.get('samples_to_evaluate_certainty_per_iter', 200)
     samples_to_query_vlm_per_iter = vlm_config.get('samples_to_query_vlm_per_iter', 50)
     vlm_query_template = vlm_config.get('vlm_query_template', "Is the primary object in this segmented region a {label_name}?")
-
+    current_model = None
 
     for iteration in range(num_vlm_iterations):
         logger.info(f"--- VLM Iteration {iteration + 1} / {num_vlm_iterations} ---")
         
+        iter_output_dir = os.path.join(output_dir, f"iteration_{iteration + 1}")
+        os.makedirs(iter_output_dir, exist_ok=True)
+        
         # --- 5.A. Prepare Training Data for Current Iteration ---
         logger.info("Preparing training data for current iteration...")
+        gt_indices_in_pool = current_gt_labeled_indices.copy()
+        pseudo_indices_in_pool = list(pseudo_labels_for_indices.keys())
         
-        # Split the data into ground truth indices and pseudo-labeled indices
-        gt_indices = current_gt_labeled_indices.copy()
-        pseudo_indices = list(pseudo_labels_for_indices.keys())
-        
-        if not gt_indices and not pseudo_indices:
+        iter_train_datasets_to_combine = []
+
+        if not gt_indices_in_pool and not pseudo_indices_in_pool:
             logger.warning("No training data (GT or pseudo) available. Skipping training for this iteration.")
-            if iteration == 0:
-                logger.error("No initial training data. Check initial_training_percentage or data loading.")
-                break
-            continue
-            
-        logger.info(f"Training with {len(gt_indices)} ground truth samples and {len(pseudo_indices)} pseudo-labeled samples")
-        
-        # Create a new dataset for this iteration that combines ground truth and pseudo-labeled data
-        # 1. Get the original samples for ground truth data
-        if gt_indices:
-            gt_dataset_raw = full_train_data.select(gt_indices)
+            # Model remains 'current_model' from previous iter or None
         else:
-            gt_dataset_raw = None
+            logger.info(f"Training with {len(gt_indices_in_pool)} GT samples and {len(pseudo_indices_in_pool)} pseudo-labeled samples")
+            if gt_indices_in_pool:
+                processed_gt_data_for_iter = processed_train_pool.select(gt_indices_in_pool)
+                iter_train_datasets_to_combine.append(processed_gt_data_for_iter)
             
-        # 2. For pseudo-labeled samples, we need to replace the masks
-        if pseudo_indices:
-            # Start by selecting the samples with their original images
-            pseudo_dataset_raw = full_train_data.select(pseudo_indices)
-            
-            # Create a new dataset with the updated masks
-            pseudo_samples = []
-            for i, idx in enumerate(pseudo_indices):
-                # Get original sample for the image
-                original_sample = full_train_data[idx]
+            if pseudo_indices_in_pool:
+                pseudo_samples_raw_with_new_masks = []
+                for idx_in_pool in pseudo_indices_in_pool:
+                    original_raw_sample = raw_train_data_subset[idx_in_pool]
+                    pseudo_mask_pil = pseudo_labels_for_indices[idx_in_pool]
+                    pseudo_samples_raw_with_new_masks.append({
+                        dataset_config['image_col']: original_raw_sample[dataset_config['image_col']],
+                        dataset_config['mask_col']: pseudo_mask_pil
+                    })
                 
-                # Ensure pseudo mask is in numpy format for HF Dataset
-                pseudo_mask_np = ensure_mask_as_numpy(pseudo_labels_for_indices[idx])
-                
-                # Create new sample with original image but pseudo mask
-                new_sample = {
-                    dataset_config['image_col']: original_sample[dataset_config['image_col']],
-                    dataset_config['mask_col']: pseudo_mask_np
-                }
-                pseudo_samples.append(new_sample)
-                
-            # Create dataset from the prepared samples
-            from datasets import Dataset as HFDataset
-            pseudo_dataset_raw = HFDataset.from_dict({
-                dataset_config['image_col']: [s[dataset_config['image_col']] for s in pseudo_samples],
-                dataset_config['mask_col']: [s[dataset_config['mask_col']] for s in pseudo_samples]
-            })
-        else:
-            pseudo_dataset_raw = None
-            
-        # 3. Combine the raw datasets
-        if gt_dataset_raw is not None and pseudo_dataset_raw is not None:
-            from datasets import concatenate_datasets
-            combined_dataset_raw = concatenate_datasets([gt_dataset_raw, pseudo_dataset_raw])
-        elif gt_dataset_raw is not None:
-            combined_dataset_raw = gt_dataset_raw
-        else:
-            combined_dataset_raw = pseudo_dataset_raw
-            
-        # 4. Apply preprocessing to the combined dataset
-        logger.info(f"Preprocessing combined dataset with {len(combined_dataset_raw)} samples...")
-        processed_iter_train_dataset = combined_dataset_raw.map(
-            shared_preprocess_fn,
-            batched=True,
-            batch_size=training_config.get('per_device_train_batch_size', 8),
-            remove_columns=combined_dataset_raw.column_names,
-            load_from_cache_file=False # Force reprocessing to avoid cache issues
-        )
-        
-        # 5. Set the torch format for the processed dataset
-        processed_iter_train_dataset.set_format("torch", columns=["pixel_values", "labels"])
-        logger.info(f"Final processed training dataset for iteration {iteration+1}: {len(processed_iter_train_dataset)} samples")
-
-        # --- 5.B. Train Segmentation Model ---
-        model = load_model_for_segmentation(
-            model_name_or_path=model_config['name'],
-            num_labels=NUM_PASCAL_VOC_LABELS,
-            id2label=PASCAL_VOC_ID2LABEL,
-            label2id=PASCAL_VOC_LABEL2ID,
-            ignore_mismatched_sizes=model_config.get('ignore_mismatched_sizes', True)
-        )
-        model = model.to(device)  # Ensure model is explicitly moved to device
-
-        # Adjust epochs per VLM iteration if needed
-        num_train_epochs_this_iter = training_config.get('num_epochs_per_vlm_iter', training_config.get('num_epochs', 3))
-
-        training_args = TrainingArguments(
-            output_dir=os.path.join(output_dir, f"training_iter_{iteration}"),
-            num_train_epochs=num_train_epochs_this_iter,
-            per_device_train_batch_size=training_config['per_device_train_batch_size'],
-            per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
-            learning_rate=float(training_config['learning_rate']),
-            weight_decay=training_config['weight_decay'],
-            eval_strategy="epoch" if num_train_epochs_this_iter > 0 else "no",
-            save_strategy="epoch" if num_train_epochs_this_iter > 0 else "no",
-            load_best_model_at_end=True if num_train_epochs_this_iter > 0 else False,
-            metric_for_best_model="eval_mean_iou",
-            greater_is_better=True,
-            logging_dir=os.path.join(output_dir, f"logs_iter_{iteration}"),
-            logging_steps=training_config.get('logging_steps', 50),
-            remove_unused_columns=False,
-            report_to="wandb" if general_config.get('wandb_enabled', False) else "none",
-        )
-
-        trainer = SegmentationTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=processed_iter_train_dataset if len(processed_iter_train_dataset) > 0 else None,
-            eval_dataset=processed_val_dataset,
-            compute_metrics=compute_metrics_segmentation,
-        )
-        
-        if len(processed_iter_train_dataset) > 0 and num_train_epochs_this_iter > 0:
-            logger.info(f"Starting model training for iteration {iteration + 1} ({num_train_epochs_this_iter} epochs)...")
-            train_result = trainer.train()
-            logger.info(f"Training finished. Metrics: {train_result.metrics}")
-            model = trainer.model # Use the best model loaded by trainer
-        elif len(processed_iter_train_dataset) == 0 :
-             logger.info("Skipping training as training dataset is empty.")
-        else: # num_train_epochs_this_iter is 0
-             logger.info("Skipping training as num_epochs_per_vlm_iter is 0.")
-
-
-        # --- 5.C. Predict on Unlabeled Data & Select Most Certain Samples ---
-        if not unlabeled_indices:
-            logger.info("No unlabeled data left. Ending VLM iterations.")
-            break
-        
-        num_to_eval_cert = min(len(unlabeled_indices), samples_to_evaluate_certainty_per_iter)
-        indices_to_eval_certainty_this_iter = random.sample(unlabeled_indices, num_to_eval_cert)
-        logger.info(f"Predicting on {len(indices_to_eval_certainty_this_iter)} unlabeled samples to find candidates for VLM...")
-        
-        model.eval()
-        candidate_predictions = [] # List of (certainty, original_idx, image_pil, pred_mask_pil_full, dominant_label_name)
-        
-        with torch.no_grad():
-            for original_idx in tqdm(indices_to_eval_certainty_this_iter, desc="Certainty Calculation"):
-                # Get preprocessed tensor data for this sample
-                try:
-                    preprocessed_sample = processed_full_train_data[original_idx]
-                    pixel_values = preprocessed_sample["pixel_values"].unsqueeze(0).to(device)  # Add batch dimension
-                except Exception as e:
-                    # If there's an issue with the preprocessed data, process on-the-fly
-                    logger.warning(f"Error using preprocessed data for prediction on sample {original_idx}: {e}. Processing on-the-fly.")
-                    raw_sample = full_train_data[original_idx]
-                    image_pil_val = raw_sample[dataset_config['image_col']]
-                    if isinstance(image_pil_val, Image.Image):
-                        image_pil = image_pil_val
-                    elif isinstance(image_pil_val, dict) and 'path' in image_pil_val:
-                        image_pil = Image.open(image_pil_val['path']).convert("RGB")
-                    elif isinstance(image_pil_val, str): # Direct path string
-                        image_pil = Image.open(image_pil_val).convert("RGB")
-                    else:
-                        logger.warning(f"Unexpected image format for sample {original_idx}. Skipping.")
-                        continue
-                    
-                    # Process the image directly with the image processor
-                    inputs = image_processor(images=image_pil, return_tensors="pt")
-                    pixel_values = inputs.pixel_values.to(device)
-                
-                # For VLM verification later, we need the original image
-                raw_sample = full_train_data[original_idx]
-                image_pil_val = raw_sample[dataset_config['image_col']]
-                if isinstance(image_pil_val, Image.Image):
-                    image_pil = image_pil_val
-                elif isinstance(image_pil_val, dict) and 'path' in image_pil_val:
-                    image_pil = Image.open(image_pil_val['path']).convert("RGB")
-                elif isinstance(image_pil_val, str): # Direct path string
-                    image_pil = Image.open(image_pil_val).convert("RGB")
-                else:
-                    logger.warning(f"Unexpected image format for sample {original_idx}. Skipping.")
-                    continue
-
-                # Run model on preprocessed tensors
-                outputs = model(pixel_values=pixel_values)
-                logits = outputs.logits 
-
-                original_height, original_width = image_pil.size[1], image_pil.size[0]
-                upsampled_logits = torch.nn.functional.interpolate(
-                    logits, size=(original_height, original_width), mode="bilinear", align_corners=False
+                temp_pseudo_dataset_raw = Dataset.from_list(pseudo_samples_raw_with_new_masks)
+                logger.info(f"Preprocessing {len(temp_pseudo_dataset_raw)} pseudo-labeled samples for iteration {iteration + 1}...")
+                processed_pseudo_data_for_iter = temp_pseudo_dataset_raw.map(
+                    shared_preprocess_fn,
+                    batched=True,
+                    batch_size=training_config.get('per_device_train_batch_size', 8),
+                    remove_columns=temp_pseudo_dataset_raw.column_names,
+                    load_from_cache_file=False, # Crucial for dynamic pseudo-labels
+                    desc=f"Preprocessing pseudo-labels for iter {iteration+1}"
                 )
-                pred_mask_tensor = upsampled_logits.argmax(dim=1) 
-                pred_mask_np = pred_mask_tensor.squeeze().cpu().numpy().astype(np.uint8)
-                
-                # Get dominant label and the full predicted mask (as PIL)
-                dominant_label_name, pred_mask_pil_full, dominant_label_id = get_dominant_label_and_mask_from_prediction(
-                    pred_mask_np, PASCAL_VOC_ID2LABEL
-                )
+                processed_pseudo_data_for_iter.set_format("torch", columns=["pixel_values", "labels"])
+                iter_train_datasets_to_combine.append(processed_pseudo_data_for_iter)
+            
+            processed_iter_train_dataset = None
+            if len(iter_train_datasets_to_combine) > 1:
+                processed_iter_train_dataset = concatenate_datasets(iter_train_datasets_to_combine).shuffle(seed=general_config['seed'])
+            elif iter_train_datasets_to_combine:
+                processed_iter_train_dataset = iter_train_datasets_to_combine[0].shuffle(seed=general_config['seed'])
+            
+            if processed_iter_train_dataset and len(processed_iter_train_dataset) > 0:
+                logger.info(f"Final processed training dataset for iteration {iteration+1}: {len(processed_iter_train_dataset)} samples")
 
-                if dominant_label_name and pred_mask_pil_full:
-                    certainty = calculate_prediction_certainty(upsampled_logits.cpu(), pred_mask_np, dominant_label_id)
-                    candidate_predictions.append(
-                        (certainty, original_idx, image_pil, pred_mask_pil_full, dominant_label_name)
+                # --- 5.B. Train Segmentation Model ---
+                model_path_for_iter = model_config['name']
+                if current_model is not None and vlm_config.get('continue_training_from_checkpoint', True):
+                    # If we have a model from a previous iteration, we can use its path to continue training
+                    # This assumes current_model is the actual model object, not a path.
+                    # For continuing training with Trainer, it's often easier to just pass the model object.
+                    # If 'current_model' was a path, then model_path_for_iter = current_model
+                    logger.info(f"Continuing training from model of previous iteration.")
+                    model = current_model # Use the model object directly
+                else: # Load fresh or specified base model
+                    logger.info(f"Loading segmentation model: {model_path_for_iter} for iteration {iteration+1}")
+                    model = load_model_for_segmentation(
+                        model_name_or_path=model_path_for_iter,
+                        num_labels=NUM_PASCAL_VOC_LABELS,
+                        id2label=PASCAL_VOC_ID2LABEL,
+                        label2id=PASCAL_VOC_LABEL2ID,
+                        ignore_mismatched_sizes=model_config.get('ignore_mismatched_sizes', True)
                     )
-        
-        candidate_predictions.sort(key=lambda x: x[0], reverse=True) # Sort by certainty
-        vlm_query_candidates = candidate_predictions[:samples_to_query_vlm_per_iter]
-        logger.info(f"Selected {len(vlm_query_candidates)} most certain candidates for VLM verification.")
+                model.to(device)
 
-        # --- 5.D. VLM Verification ---
-        newly_verified_indices_count = 0
-        if not vlm_query_candidates:
-            logger.info("No candidates to send to VLM this iteration.")
-        
-        for cert, orig_idx, img_pil, pred_mask_pil_to_save, dom_label_name in tqdm(vlm_query_candidates, desc="VLM Verification"):
-            if orig_idx not in unlabeled_indices: continue # Already processed
+                iter_training_args_output_dir = os.path.join(iter_output_dir, "training_checkpoints")
+                os.makedirs(iter_training_args_output_dir, exist_ok=True)
 
-            vlm_query = vlm_query_template.format(label_name=dom_label_name)
-            try:
-                # Pass the full predicted mask (multi-class) as context if VLM can use it.
-                # The question is about the dominant label found in that mask.
-                vlm_confirms = vlm_handler.ask_binary_question(
-                    image=img_pil,
-                    segmentation_mask=pred_mask_pil_to_save, 
-                    prompt=vlm_query
+                iter_training_args = TrainingArguments(
+                    output_dir=iter_training_args_output_dir,
+                    num_train_epochs=training_config.get('num_train_epochs_per_iter', 3),
+                    per_device_train_batch_size=training_config['per_device_train_batch_size'],
+                    per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
+                    save_strategy=training_config.get("save_strategy_per_iter", "epoch"),
+                    evaluation_strategy=training_config.get("evaluation_strategy_per_iter", "epoch"),
+                    logging_steps=training_config.get('logging_steps', 50),
+                    learning_rate=training_config.get('learning_rate_per_iter', 5e-5),
+                    weight_decay=training_config.get('weight_decay', 0.01),
+                    metric_for_best_model=training_config.get('metric_for_best_model', 'eval_mean_iou'),
+                    load_best_model_at_end=training_config.get('load_best_model_at_end_per_iter', True),
+                    remove_unused_columns=False,
+                    fp16=training_config.get('fp16', False) and torch.cuda.is_available(),
+                    report_to=["wandb"] if general_config.get('wandb_enabled', False) and wandb else ["none"],
+                    seed=general_config['seed'],
+                    logging_dir=os.path.join(iter_output_dir, 'logs'),
+                    disable_tqdm=general_config.get('disable_tqdm', False),
+                    push_to_hub=False,
                 )
-            except Exception as e:
-                logger.error(f"Error during VLM query for sample {orig_idx} (label: {dom_label_name}): {e}. Skipping.", exc_info=True)
-                vlm_confirms = False
 
-            if vlm_confirms:
-                # Convert the predicted mask to numpy array and store it
-                pseudo_labels_for_indices[orig_idx] = ensure_mask_as_numpy(pred_mask_pil_to_save)
-                newly_verified_indices_count += 1
+                compute_metrics_fn = partial(
+                    compute_metrics_segmentation,
+                    num_labels=NUM_PASCAL_VOC_LABELS,
+                    ignore_index=255
+                )
+                
+                callbacks = []
+                if training_config.get('early_stopping_patience_per_iter', 0) > 0 :
+                    callbacks.append(EarlyStoppingCallback(
+                        early_stopping_patience=training_config['early_stopping_patience_per_iter'],
+                        early_stopping_threshold=training_config.get('early_stopping_threshold_per_iter', 0.0)
+                    ))
+                
+                trainer = Trainer(
+                    model=model,
+                    args=iter_training_args,
+                    train_dataset=processed_iter_train_dataset,
+                    eval_dataset=processed_val_dataset,
+                    compute_metrics=compute_metrics_fn,
+                    callbacks=callbacks if callbacks else None,
+                )
+
+                logger.info(f"Starting training for VLM iteration {iteration + 1}...")
+                train_result = trainer.train()
+                logger.info(f"Training finished for iteration {iteration + 1}. Metrics: {train_result.metrics}")
+                
+                current_model = trainer.model 
+                model_save_path = os.path.join(iter_output_dir, "best_model_from_iter")
+                current_model.save_pretrained(model_save_path)
+                logger.info(f"Saved model from iteration {iteration+1} to {model_save_path}")
+
+
+                logger.info(f"Evaluating model from iteration {iteration + 1} on validation set...")
+                eval_metrics = trainer.evaluate(eval_dataset=processed_val_dataset)
+                logger.info(f"Validation Metrics (Iter {iteration + 1}): {eval_metrics}")
+                if general_config.get('wandb_enabled', False) and wandb:
+                    wandb.log({f"iter_{iteration+1}_val/{k}": v for k,v in eval_metrics.items()}, step=iteration+1)
+            else:
+                logger.warning(f"Skipping model training for iteration {iteration + 1} due to no training data.")
+
+        # --- 5.C. Generate Predictions on Unlabeled Pool ---
+        if current_model is None:
+            logger.error(f"No model available at iteration {iteration+1} to make predictions. Attempting to load base model.")
+            current_model = load_model_for_segmentation(
+                model_name_or_path=model_config['name'], 
+                num_labels=NUM_PASCAL_VOC_LABELS, id2label=PASCAL_VOC_ID2LABEL, label2id=PASCAL_VOC_LABEL2ID,
+                ignore_mismatched_sizes=model_config.get('ignore_mismatched_sizes', True)
+            ).to(device)
+            if current_model is None: # Still None after trying to load
+                 logger.error(f"Failed to load base model. Cannot proceed with VLM queries for iter {iteration+1}.")
+                 if iteration < num_vlm_iterations -1:
+                     continue # Try next iteration, maybe data will appear
+                 else:
+                     break # End of iterations
+
+        if not unlabeled_indices:
+            logger.info("No more unlabeled samples to query. Ending VLM iterations.")
+            break
+
+        logger.info(f"Generating predictions for {len(unlabeled_indices)} unlabeled samples...")
+        unlabeled_processed_data_for_prediction = processed_train_pool.select(unlabeled_indices)
+        unlabeled_raw_data_for_vlm = raw_train_data_subset.select(unlabeled_indices) # For VLM interaction
+
+        pred_args_output_dir = os.path.join(iter_output_dir, f"predictions_iter_{iteration+1}")
+        # os.makedirs(pred_args_output_dir, exist_ok=True) # Not strictly needed for TrainingArguments if not saving from it
+
+        pred_args = TrainingArguments(
+            output_dir=pred_args_output_dir, # Needs to be a dir
+            per_device_eval_batch_size=training_config['per_device_eval_batch_size'] * 2,
+            remove_unused_columns=False,
+            fp16=training_config.get('fp16', False) and torch.cuda.is_available(),
+            report_to="none",
+        )
+        prediction_trainer = Trainer(model=current_model, args=pred_args)
         
-        if newly_verified_indices_count > 0:
-            # Update unlabeled_indices by removing ALL keys from pseudo_labels_for_indices
-            # This ensures if a sample was previously pseudo-labeled and re-queried (not current logic, but for future), it's handled.
-            # More simply for now: remove those that just got added.
-            newly_added_keys_this_iter = [item[1] for item in vlm_query_candidates if item[1] in pseudo_labels_for_indices and item[1] in unlabeled_indices]
-            unlabeled_indices = [idx for idx in unlabeled_indices if idx not in newly_added_keys_this_iter]
+        logger.info(f"Predicting on {len(unlabeled_processed_data_for_prediction)} unlabeled samples...")
+        predictions_output = prediction_trainer.predict(unlabeled_processed_data_for_prediction)
+        logits_unlabeled = predictions_output.predictions # Shape: (N, NumClasses, H, W)
+
+        # --- 5.D. Select Samples for VLM Query based on Certainty ---
+        num_to_evaluate_for_vlm = min(samples_to_evaluate_certainty_per_iter, len(unlabeled_indices))
+        indices_to_consider_for_vlm_query_relative = random.sample(range(len(unlabeled_indices)), num_to_evaluate_for_vlm)
+        
+        certainty_scores = [] # List of (original_pool_idx, certainty_score, pred_mask_np_for_vlm, dominant_label_id_for_vlm)
+
+        logger.info(f"Calculating certainty for {len(indices_to_consider_for_vlm_query_relative)} candidate samples...")
+        for rel_idx in tqdm(indices_to_consider_for_vlm_query_relative, desc="Certainty Calc"):
+            original_pool_idx = unlabeled_indices[rel_idx]
+            sample_logits = torch.tensor(logits_unlabeled[rel_idx]).unsqueeze(0).to(device) # (1, NumClasses, H, W)
             
-            logger.info(f"VLM added {newly_verified_indices_count} new pseudo-labels this iteration.")
-            logger.info(f"Total pseudo-labels: {len(pseudo_labels_for_indices)}. Remaining unlabeled: {len(unlabeled_indices)}")
-        else:
-            logger.info("VLM did not add any new pseudo-labels this iteration.")
-            # Optional: Add convergence criteria (e.g., break if no new samples for X iters)
+            # Upsample logits to original image size if necessary.
+            # This is a critical step. Assuming Segformer output matches processed input size.
+            # If preprocess_data resizes images to fixed size (e.g., 512x512), and model outputs logits at this size,
+            # then direct use might be fine. Otherwise, upsampling to original image dimensions is needed.
+            # For now, we pass sample_logits directly. The `calculate_prediction_certainty` needs to handle this.
+            # The `pred_mask_np` should be derived from the same logits (potentially upsampled) used for certainty.
+            
+            # For Segformer, logits are typically 1/4 of input image resolution. They NEED upsampling.
+            # Let's get the target size from the raw image associated with this sample.
+            raw_img_pil = unlabeled_raw_data_for_vlm[rel_idx][dataset_config['image_col']]
+            target_height, target_width = raw_img_pil.height, raw_img_pil.width
 
-        # --- 5.E. Logging & Evaluation on Validation Set ---
-        if len(processed_val_dataset) > 0 and trainer.eval_dataset:
-            logger.info(f"Evaluating model from iteration {iteration + 1} on validation set...")
-            eval_metrics = trainer.evaluate(eval_dataset=processed_val_dataset) # trainer.eval_dataset should be processed_val_dataset
-            logger.info(f"Validation Metrics Iteration {iteration + 1}: {eval_metrics}")
-            if general_config.get('wandb_enabled', False) and 'wandb' in sys.modules:
-                import wandb
-                wandb_metrics = {f"val_iter_{iteration+1}_{k.replace('eval_', '')}": v for k,v in eval_metrics.items()}
-                wandb_metrics[f"iter_{iteration+1}_newly_verified"] = newly_verified_indices_count
-                wandb_metrics[f"iter_{iteration+1}_total_pseudo_labels"] = len(pseudo_labels_for_indices)
-                wandb_metrics[f"iter_{iteration+1}_unlabeled_pool_size"] = len(unlabeled_indices)
-                wandb.log(wandb_metrics, step=iteration + 1)
-        else:
-            logger.info("Skipping validation set evaluation as it's empty or not provided to trainer.")
+            upsampled_logits_for_certainty = torch.nn.functional.interpolate(
+                sample_logits.float(), # Ensure float for interpolate
+                size=(target_height, target_width),
+                mode='bilinear',
+                align_corners=False
+            )
 
+            pred_mask_tensor = torch.argmax(upsampled_logits_for_certainty.squeeze(0), dim=0) # (H_orig, W_orig)
+            pred_mask_np = pred_mask_tensor.cpu().numpy().astype(np.uint8)
+
+            unique_labels, counts = np.unique(pred_mask_np, return_counts=True)
+            valid_labels_mask = unique_labels != 255 # Assuming 255 is ignore_index
+            unique_labels = unique_labels[valid_labels_mask]
+            counts = counts[valid_labels_mask]
+
+            dominant_label_id_for_vlm = None
+            if len(unique_labels) > 0:
+                dominant_label_id_for_vlm = unique_labels[np.argmax(counts)]
+            
+            certainty = calculate_prediction_certainty(
+                logits=upsampled_logits_for_certainty, 
+                pred_mask_np=pred_mask_np,
+                dominant_label_id=dominant_label_id_for_vlm,
+                ignore_index=255
+            )
+            certainty_scores.append((original_pool_idx, certainty, pred_mask_np, dominant_label_id_for_vlm))
+
+        certainty_scores.sort(key=lambda x: x[1]) # Sort by certainty (ascending, least certain first)
+        num_to_query_vlm_this_iter = min(samples_to_query_vlm_per_iter, len(certainty_scores))
+        selected_samples_for_vlm_query = certainty_scores[:num_to_query_vlm_this_iter]
+
+        logger.info(f"Selected {len(selected_samples_for_vlm_query)} least certain samples for VLM query.")
+
+        # --- 5.E. Query VLM for selected samples ---
+        newly_pseudo_labeled_pool_indices = [] 
+        vlm_agreements = 0
+
+        for original_pool_idx, _, pred_mask_np_for_vlm, dominant_label_id_for_vlm in tqdm(selected_samples_for_vlm_query, desc="VLM Querying"):
+            # Find relative index in unlabeled_indices to fetch the correct raw image
+            try:
+                rel_idx_in_unlabeled = unlabeled_indices.index(original_pool_idx)
+            except ValueError: # Should not happen if logic is correct
+                logger.error(f"Error: original_pool_idx {original_pool_idx} not found in unlabeled_indices during VLM query phase.")
+                continue
+
+            image_for_vlm = unlabeled_raw_data_for_vlm[rel_idx_in_unlabeled][dataset_config['image_col']] # PIL Image
+            pred_mask_pil_for_vlm = Image.fromarray(pred_mask_np_for_vlm, mode='L') # From certainty calculation
+
+            if dominant_label_id_for_vlm is not None and dominant_label_id_for_vlm != 255:
+                dominant_label_name = PASCAL_VOC_ID2LABEL.get(dominant_label_id_for_vlm, "unknown object")
+                question = vlm_query_template.format(label_name=dominant_label_name)
+                
+                try:
+                    vlm_response = vlm_handler.get_vlm_feedback_for_sample(
+                        image=image_for_vlm,
+                        predicted_mask=pred_mask_pil_for_vlm,
+                        dominant_class_id=int(dominant_label_id_for_vlm), # Ensure it's int
+                        question=question,
+                    )
+
+                    if vlm_response.lower().strip() == "yes":
+                        pseudo_labels_for_indices[original_pool_idx] = pred_mask_pil_for_vlm
+                        newly_pseudo_labeled_pool_indices.append(original_pool_idx)
+                        vlm_agreements +=1
+                except Exception as e:
+                    logger.error(f"Error during VLM query for sample (pool idx {original_pool_idx}): {e}", exc_info=True)
+            else:
+                logger.debug(f"Skipping VLM query for sample (pool idx {original_pool_idx}) as no valid dominant class found.")
+        
+        if general_config.get('wandb_enabled', False) and wandb:
+            wandb.log({
+                f"iter_{iteration+1}_vlm/pseudo_labels_added": len(newly_pseudo_labeled_pool_indices),
+                f"iter_{iteration+1}_vlm/agreements": vlm_agreements,
+                f"iter_{iteration+1}_vlm/queries_made": len(selected_samples_for_vlm_query) # Number of samples sent to VLM
+            }, step=iteration+1)
+
+
+        # --- 5.F. Update Datasets for Next Iteration ---
+        if newly_pseudo_labeled_pool_indices:
+            # These are now considered "labeled" for the next round by virtue of VLM agreement.
+            # They are already in pseudo_labels_for_indices.
+            # We need to move them from unlabeled_indices to current_gt_labeled_indices for the *next* iteration's GT pool.
+            
+            # Add to GT pool for next iteration
+            current_gt_labeled_indices.extend(newly_pseudo_labeled_pool_indices)
+            current_gt_labeled_indices = sorted(list(set(current_gt_labeled_indices)))
+            
+            # Remove from unlabeled pool
+            unlabeled_indices = sorted(list(set(unlabeled_indices) - set(newly_pseudo_labeled_pool_indices)))
+            
+            # The pseudo-labels in pseudo_labels_for_indices for these newly_pseudo_labeled_pool_indices
+            # will be consumed in the next iteration's data prep. After that, they are effectively part of GT.
+            # So, we can clear them from pseudo_labels_for_indices *after* they are used to form the next training set,
+            # or simply let them be overwritten if re-queried (though they shouldn't be if moved out of unlabeled_indices).
+            # For simplicity, items in newly_pseudo_labeled_pool_indices are now "GT-like" for the next iter.
+            # The pseudo_labels_for_indices store will be used to build the pseudo part of the *next* training set.
+            # If an index is in current_gt_labeled_indices, it will be sourced from processed_train_pool.
+            # If an index is in pseudo_labels_for_indices, it will be built from raw + PIL mask.
+            # The current logic correctly separates these.
+            # We *do not* remove from pseudo_labels_for_indices here, as they are needed for the *next* iteration's pseudo data construction.
+            # They are removed from `unlabeled_indices` so they are not candidates for VLM query again.
+            # And they are added to `current_gt_labeled_indices` so they are part of the "known" set.
+            # This means in the next iteration, if an index is in BOTH `current_gt_labeled_indices` AND `pseudo_labels_for_indices`,
+            # the GT version from `processed_train_pool` will be used. This is fine.
+            # The `pseudo_labels_for_indices` should ideally only contain labels for things *not yet* in `current_gt_labeled_indices`.
+            # Let's refine: once a pseudo-label is accepted and the index moves to `current_gt_labeled_indices`,
+            # it should no longer be in `pseudo_labels_for_indices` because its "ground truth" is now the VLM-confirmed mask,
+            # which will be part of the GT dataset construction.
+            
+            # Refined logic:
+            # The samples in newly_pseudo_labeled_pool_indices have their pseudo-labels stored in pseudo_labels_for_indices.
+            # These will be used in the *next* iteration to construct the "pseudo" part of the training data.
+            # After that training, they effectively become part of the "known" set.
+            # The current_gt_labeled_indices are those with original ground truth.
+            # This seems okay. The key is that `unlabeled_indices` shrinks.
+
+        logger.info(f"End of VLM Iteration {iteration + 1}:")
+        logger.info(f"  GT Labeled samples (original GT + VLM confirmed for next iter): {len(current_gt_labeled_indices)}")
+        logger.info(f"  Unlabeled samples remaining for query: {len(unlabeled_indices)}")
+        logger.info(f"  Current pseudo-label store size (for next iter pseudo data): {len(pseudo_labels_for_indices)}")
+        if general_config.get('wandb_enabled', False) and wandb:
+            wandb.log({
+                f"iter_{iteration+1}_dataset/total_gt_labeled_for_next_iter": len(current_gt_labeled_indices),
+                f"iter_{iteration+1}_dataset/total_unlabeled_for_query": len(unlabeled_indices),
+                f"iter_{iteration+1}_dataset/pseudo_label_store_size": len(pseudo_labels_for_indices),
+            }, step=iteration+1)
 
     # --- 6. Final Evaluation on Test Set ---
-    logger.info("VLM iterations finished. Performing final evaluation on the test set...")
-    final_model = trainer.model 
-    if len(processed_test_dataset) > 0 and trainer.eval_dataset : # Check if test set can be evaluated
-        test_metrics = trainer.evaluate(eval_dataset=processed_test_dataset, metric_key_prefix="final_test")
-        logger.info(f"Final Test Metrics: {test_metrics}")
-        if general_config.get('wandb_enabled', False) and 'wandb' in sys.modules:
-            import wandb
-            wandb.log({f"final_test_{k.replace('eval_', '')}": v for k,v in test_metrics.items()})
-    else:
-        logger.info("Skipping final test set evaluation as it's empty or not provided.")
+    if current_model and processed_test_dataset and len(processed_test_dataset) > 0:
+        logger.info("\n--- Final Evaluation on FIXED Test Set ---")
+        final_eval_output_dir = os.path.join(output_dir, "final_evaluation")
+        os.makedirs(final_eval_output_dir, exist_ok=True)
 
-    logger.info(f"VLM-ITL pipeline finished. Results in {output_dir}")
-    if general_config.get('wandb_enabled', False) and 'wandb' in sys.modules:
-        import wandb
+        final_eval_args = TrainingArguments(
+            output_dir=final_eval_output_dir,
+            per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
+            fp16=training_config.get('fp16', False) and torch.cuda.is_available(),
+            report_to="none",
+            remove_unused_columns=False,
+        )
+        final_trainer = Trainer(
+            model=current_model,
+            args=final_eval_args,
+            eval_dataset=processed_test_dataset,
+            compute_metrics=compute_metrics_fn, # Defined earlier
+        )
+        test_metrics = final_trainer.evaluate(eval_dataset=processed_test_dataset)
+        logger.info(f"Final Test Set Metrics: {test_metrics}")
+
+        final_model_path = os.path.join(output_dir, "final_model_from_vlm_itl")
+        current_model.save_pretrained(final_model_path)
+        
+        test_metrics_path = os.path.join(final_eval_output_dir, "test_results.json")
+        with open(test_metrics_path, "w") as f:
+            json.dump(test_metrics, f, indent=4)
+        logger.info(f"Final model saved to {final_model_path}")
+        logger.info(f"Final test metrics saved to {test_metrics_path}")
+
+        if general_config.get('wandb_enabled', False) and wandb:
+            wandb.log({"final_test/mean_iou": test_metrics.get('eval_mean_iou', 0.0), # Log specific key metrics
+                       "final_test/accuracy": test_metrics.get('eval_accuracy', 0.0)}) 
+            # Log all test metrics
+            for k, v in test_metrics.items():
+                wandb.summary[f"final_test_{k.replace('eval_','')}"] = v
+
+
+    elif not current_model:
+         logger.error("VLM-ITL loop did not produce a final model. Skipping final evaluation.")
+    else: 
+         logger.warning("No test set available or processed test set is empty. Skipping final evaluation.")
+
+    if general_config.get('wandb_enabled', False) and wandb and wandb.run:
         wandb.finish()
+    logger.info("VLM-ITL pipeline finished.")
+
 
 if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        #config_file_path = sys.argv[1]
-        config_file_path = "configs/vlm_itl_config.yaml" # For testing
-        # Basic check if config file exists
-        if not os.path.isfile(config_file_path):
-            logger.error(f"Configuration file not found: {config_file_path}")
-            sys.exit(1)
-        run_vlm_itl_pipeline(config_file_path)
-    else:
-        logger.error("Please provide the path to the configuration file as a command-line argument.")
-        logger.info("Example: python scripts/train_vlm_itl.py configs/vlm_itl_config.yaml")
-        sys.exit(1)
+    # Argument parsing should be here, similar to train_active_learning_overlap.py
+    # For now, assume config path is hardcoded or passed directly for testing.
+    # Example:
+    # config_file_path = 'configs/vlm_itl_config.yaml' 
+    # run_vlm_itl_pipeline(config_file_path)
+
+    # Using argparse like in the other script:
+    import argparse # Make sure argparse is imported
+    parser = argparse.ArgumentParser(description="Run VLM-In-The-Loop pipeline for Image Segmentation")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default='configs/vlm_itl_config.yaml', # Default config path
+        help="Path to the VLM-ITL configuration YAML file."
+    )
+    args = parser.parse_args()
+
+    # Setup basic logging if not already configured by logger setup
+    logging.basicConfig(
+        level=logging.INFO, # Changed to INFO to see more details by default
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    
+    run_vlm_itl_pipeline(args.config)

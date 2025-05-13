@@ -1,5 +1,5 @@
 project_name: "pascal-voc-segmentation"
-run_name_prefix: "AL-b4-BD" # Run name will be appended with iteration info
+run_name_prefix: "AL-b0-BD" # Run name will be appended with iteration info
 output_dir_prefix: "./results/active_learning" # Output dir will be appended
 seed: 42
 log_with: "none"
@@ -7,7 +7,7 @@ debug: False # Set to True for debugging purposes
 
 dataset:
   name: "nateraw/pascal-voc-2012"
-  feature_extractor_name: "nvidia/segformer-b4-finetuned-ade-512-512"
+  feature_extractor_name: "nvidia/segformer-b0-finetuned-ade-512-512"
   image_col: "image"
   mask_col: "mask"
   val_split_percentage: 0.1 # Use 10% of train as validation (fixed across iterations)
@@ -15,7 +15,7 @@ dataset:
   load_from_cache_file: False # Set to True to use cached dataset
 
 model:
-  name: "nvidia/segformer-b4-finetuned-ade-512-512"
+  name: "nvidia/segformer-b0-finetuned-ade-512-512"
   num_labels: 21
   ignore_mismatched_sizes: True
 
