@@ -211,7 +211,9 @@ class HuggingFaceVLMHandler(VLMHandler):
         self,
         image: Image.Image,
         segmentation_mask: Optional[Image.Image], # VQA pipelines might not use the mask directly
-        prompt: str
+        prompt: str,
+        idx: Optional[int] = None, # Optional index for debugging
+        true_mask: Optional[Image.Image] = None # Optional true mask for debugging
     ) -> bool:
         visual_input_image = image
         processed_segmentation_mask_pil = None # To store the mask that is used for overlay
@@ -270,9 +272,12 @@ class HuggingFaceVLMHandler(VLMHandler):
         
         # Save debug images if flag is set
         if self.config.get("save_vlm_debug_images", False) and segmentation_mask:
-            debug_dir = "vlm_debug_output"
+            debug_dir = self.config["debug_dir"]
             os.makedirs(debug_dir, exist_ok=True)
-            img_suffix = random.randint(10000, 99999)
+            if idx is not None:
+                img_suffix = f"{idx}"    
+            else:
+                img_suffix = random.randint(10000, 99999)
             try:
                 # Ensure all images are in RGB for consistent handling
                 original_rgb = image.convert("RGB")
@@ -298,6 +303,10 @@ class HuggingFaceVLMHandler(VLMHandler):
                     placeholder = Image.new("RGB", original_rgb.size, "gray")
                     images_to_combine.append(placeholder)
                 images_to_combine.append(overlaid_rgb)
+                if true_mask:
+                    # Add the true mask if provided
+                    true_mask_rgb = true_mask.convert("RGB")
+                    images_to_combine.append(true_mask_rgb)
 
                 # Assuming all images are resized to the same dimensions (original_rgb.size)
                 # or that visual_input_image and processed_segmentation_mask_pil were resized to image.size

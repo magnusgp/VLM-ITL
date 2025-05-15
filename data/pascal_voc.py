@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 from datasets import load_dataset, Dataset, DatasetDict
 from transformers import SegformerImageProcessor
 from typing import Dict, Any, Tuple, Optional, List
@@ -6,6 +8,8 @@ from PIL import Image
 import random
 import logging
 import torch
+
+
 
 logger = logging.getLogger(__name__)
 

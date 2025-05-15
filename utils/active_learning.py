@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 import random
 import math
 import logging
@@ -22,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 from typing import Tuple, Dict
 import torch.nn.functional as F
+
+
 
 def compute_mean_iou(true_mask: np.ndarray, pred_mask: np.ndarray, num_classes: int = None) -> float:
     """
@@ -87,14 +91,8 @@ def compute_image_uncertainties(
     uncertainties: Dict[int, float] = {}
     model_segmentations: Dict[int, np.ndarray] = {}
     with torch.no_grad():
-        iii=0
         #for batch in tqdm(dl, desc="Computing uncertainties", total=len(dl)):
         for batch in dl:
-            logging.info(f"Processing batch {iii}")
-            if iii > 10:
-                return uncertainties, model_segmentations
-            iii += 1
-
             pix       = batch["pixel_values"].to(device)   # [B,3,H,W]
             orig_idxs = batch["__orig_idx__"].tolist()     # [B]
             logits    = model(pix).logits                  # [B,C,H,W]
