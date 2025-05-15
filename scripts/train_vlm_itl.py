@@ -115,6 +115,9 @@ def run_vlm_itl_pipeline(config_path: str):
     logger.info(f"Starting VLM-In-The-Loop pipeline with config: {config_path}")
     config = load_config(config_path)
 
+    if config["log_with"] == "wandb":
+        setup_wandb(config, project_name=config['project_name'], run_name=config['run_name_prefix'])
+
     # --- 1. Configuration & Setup ---
     if not config.get('vlm_itl', {}).get('enabled', False):
         logger.error("VLM-ITL section not enabled in config. Set 'vlm_itl.enabled = True'.")
@@ -147,6 +150,7 @@ def run_vlm_itl_pipeline(config_path: str):
     logger.info("Initializing VLM Handler (HuggingFace BLIP)...")
     try:
         vlm_handler_config = vlm_config.get('vlm_handler', {})
+        vlm_handler_config['debug_dir'] = os.path.join(config['run_name_prefix'], 'vlm_debug')
         vlm_handler = HuggingFaceVLMHandler(vlm_handler_config)
     except Exception as e:
         logger.error(f"Failed to initialize VLM Handler: {e}", exc_info=True)
@@ -308,13 +312,14 @@ def run_vlm_itl_pipeline(config_path: str):
                 # Get the original image and segmentation mask as PIL images
                 original_image = raw_train_data_subset[idx][dataset_config['image_col']]
                 segmentation_mask = Image.fromarray(segmentations[idx].astype(np.uint8))
+                true_mask = raw_train_data_subset[idx][dataset_config['mask_col']]
                 vlm_feed_back = vlm_handler.ask_binary_question(
                     image = original_image,
                     segmentation_mask = segmentation_mask,
                     prompt=vlm_config["vlm_query_template"],
                     idx=f"{iteration}_{idx}",
+                    true_mask=true_mask,
                 )
-
                 if vlm_feed_back:
                     logger.info(f"Dominant class ID: {np.unique(segmentations[idx])}, VLM feedback: {vlm_feed_back}, {idx}")
                     good_indices.append(idx)
@@ -384,11 +389,12 @@ def run_vlm_itl_pipeline(config_path: str):
             load_best_model_at_end=training_config.get('load_best_model_at_end_per_iter', True),
             remove_unused_columns=False,
             fp16=training_config.get('fp16', False) and torch.cuda.is_available(),
-            report_to=["wandb"] if general_config.get('wandb_enabled', False) and wandb else ["none"],
+            report_to=["wandb"] if general_config.get('log_with', False) and wandb else ["none"],
             seed=general_config['seed'],
             logging_dir=os.path.join(iter_output_dir, 'logs'),
             disable_tqdm=general_config.get('disable_tqdm', False),
             push_to_hub=False,
+            run_name=run_name,
         )
 
         compute_metrics_fn = partial(
