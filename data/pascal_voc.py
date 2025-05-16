@@ -41,7 +41,7 @@ from PIL import Image
 
 PASCAL_VOC_BINARY_COLORS = [
     (0, 0, 0),   # 0=background
-    (255, 255, 255)  # 1=foreground
+    (255, 0, 0)  # 1=foreground
 ]
 
 

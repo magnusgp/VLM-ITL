@@ -250,14 +250,14 @@ def run_vlm_itl_pipeline(config_path: str):
     
 
     logger.info(f"Loading segmentation model")
-    current_model = load_model_for_segmentation(
-        model_name_or_path=model_config['name'],
-        num_labels=num_labels,
-        id2label=id2label,
-        label2id=label2id,
-        ignore_mismatched_sizes=model_config.get('ignore_mismatched_sizes', True)
-    )
-    # current_model = None
+    # current_model = load_model_for_segmentation(
+    #     model_name_or_path=model_config['name'],
+    #     num_labels=num_labels,
+    #     id2label=id2label,
+    #     label2id=label2id,
+    #     ignore_mismatched_sizes=model_config.get('ignore_mismatched_sizes', True)
+    # )
+    current_model = None
     
     current_training_indices = current_gt_labeled_indices.copy()
     for iteration in range(num_vlm_iterations):
@@ -396,7 +396,7 @@ def run_vlm_itl_pipeline(config_path: str):
             per_device_train_batch_size=training_config['per_device_train_batch_size'],
             per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
             save_strategy=training_config.get("save_strategy_per_iter", "epoch"),
-            evaluation_strategy=training_config.get("evaluation_strategy_per_iter", "epoch"),
+            eval_strategy=training_config.get("evaluation_strategy_per_iter", "epoch"),
             logging_steps=training_config.get('logging_steps', 50),
             learning_rate=training_config.get('learning_rate_per_iter', 5e-5),
             weight_decay=training_config.get('weight_decay', 0.01),
