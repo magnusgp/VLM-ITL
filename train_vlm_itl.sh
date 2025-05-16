@@ -6,14 +6,15 @@
 #BSUB -R "rusage[mem=4GB]"
 #BSUB -M 4GB
 #BSUB -W 24:00 
+#BSUB -R select[gpu32gb]
 #BSUB -gpu "num=1:mode=exclusive_process"
 #BSUB -o logs/hpc/%J.out 
 #BSUB -e logs/hpc/%J.err 
 
-cd /work3/s204075/VLM-ITL
+cd /work3/s204144/VLM-ITL
 
-export HF_HOME="/work3/s204075/.cache"
-export WANDB_DIR="/work3/s204075/.cache"
+export HF_HOME="/work3/s204144/.cache"
+export WANDB_DIR="/work3/s204144/.cache"
 
 source .venv/bin/activate
 

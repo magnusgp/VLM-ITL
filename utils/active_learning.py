@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 import random
 import math
 import logging
@@ -22,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 from typing import Tuple, Dict
 import torch.nn.functional as F
+
+
 
 def compute_mean_iou(true_mask: np.ndarray, pred_mask: np.ndarray, num_classes: int = None) -> float:
     """
@@ -88,7 +92,8 @@ def compute_image_uncertainties(
     uncertainties: Dict[int, float] = {}
     model_segmentations: Dict[int, np.ndarray] = {}
     with torch.no_grad():
-        for batch in tqdm(dl, desc="Computing uncertainties", total=len(dl)):
+        #for batch in tqdm(dl, desc="Computing uncertainties", total=len(dl)):
+        for batch in dl:
             pix       = batch["pixel_values"].to(device)   # [B,3,H,W]
             orig_idxs = batch["__orig_idx__"].tolist()     # [B]
             logits    = model(pix).logits                  # [B,C,H,W]
@@ -121,6 +126,84 @@ def compute_image_uncertainties(
                             align_corners=False
                         ).squeeze().long()
                 model_segmentations[orig_idx] = seg_mask
+    return uncertainties, model_segmentations
+
+
+def compute_segmentation_masks(
+    model,
+    dataset,
+    remaining_indices: List[int],
+    device,
+    batch_size: int = 8
+) -> Dict[int, np.ndarray]:
+    """
+    Returns:
+      model_segmentations: idx -> HxW numpy mask of model’s argmax
+    """
+    # Move model to device & set to eval
+    model.to(device)
+    model.eval()
+
+    # Subset the dataset and keep track of original indices
+    raw_subset = dataset.select(remaining_indices)
+    raw_subset = raw_subset.add_column("__orig_idx__", remaining_indices)
+
+    dl = DataLoader(
+        raw_subset,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model_segmentations: Dict[int, np.ndarray] = {}
+    # No softmax / entropy steps—just argmax on raw logits
+    with torch.no_grad():
+        for batch in dl:
+            pix       = batch["pixel_values"].to(device)  # [B,3,H,W]
+            orig_idxs = batch["__orig_idx__"].tolist()    # [B]
+            logits    = model(pix).logits                 # [B,C,H,W]
+
+            # Compute argmax mask for each image in the batch
+            # masks: [B,H,W] on CPU
+            masks = logits.argmax(dim=1).cpu().numpy()
+
+            # Store each mask under its original index
+            for idx, mask in zip(orig_idxs, masks):
+                model_segmentations[idx] = mask
+
+    return model_segmentations
+
+def mock_compute_image_uncertainties(
+    model, # Mocked, not used
+    dataset, # Mocked, not used
+    remaining_indices: List[int],
+    preprocess_fn, # Mocked, not used
+    device, # Mocked, not used
+    batch_size: int = 8 # Mocked, not used
+) -> Tuple[Dict[int, float], Dict[int, np.ndarray]]:
+    """
+    Mock version of compute_image_uncertainties.
+    Returns dummy uncertainties and model segmentations.
+    """
+    logger.info(f"Called mock_compute_image_uncertainties for {len(remaining_indices)} indices.")
+    uncertainties: Dict[int, float] = {}
+    model_segmentations: Dict[int, np.ndarray] = {}
+
+    # Generate dummy data
+    for idx in remaining_indices:
+        # Dummy uncertainty: random float between 0 and 1
+        uncertainties[idx] = random.random()
+
+        # Dummy segmentation: a 10x10 numpy array with random integers (0 or 1)
+        # You might want to adjust the shape or content based on your actual data
+        # Create a dummy segmentation with a square in the middle
+        dummy_segmentation = np.zeros((512, 512), dtype=np.uint8)
+        square_size = 128
+        start = (512 - square_size) // 2
+        end = start + square_size
+        dummy_segmentation[start:end, start:end] = 1
+        model_segmentations[idx] = dummy_segmentation
+    logger.info(f"Generated mock uncertainties for keys: {list(uncertainties.keys())[:5]}...")
+    logger.info(f"Generated mock segmentations for keys: {list(model_segmentations.keys())[:5]}...")
 
     return uncertainties, model_segmentations
 

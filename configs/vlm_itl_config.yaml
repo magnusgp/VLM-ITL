@@ -1,9 +1,10 @@
 project_name: "pascal-voc-segmentation"
-run_name_prefix: "VLM-b4-BD" # Run name will be appended with iteration info
+run_name_prefix: "VLM-b4-bi-10p-20epochs" # Run name will be appended with iteration info
 output_dir_prefix: "./results/active_learning" # Output dir will be appended
 seed: 42
 log_with: "wandb"
 debug: False # Set to True for debugging purposes
+disable_tqdm: True # Set to True to disable tqdm progress bars
 
 dataset:
   name: "nateraw/pascal-voc-2012"
@@ -13,6 +14,8 @@ dataset:
   val_split_percentage: 0.1 # Use 10% of train as validation (fixed across iterations)
   test_split_percentage: 0.1 # Use 10% of train as test (fixed across iterations)
   load_from_cache_file: False # Set to True to use cached dataset
+  binary_segmentation: True # New option, default to False
+  cache_dir: "/work3/s204144/.cache"
 
 model:
   name: "nvidia/segformer-b4-finetuned-ade-512-512"
@@ -20,8 +23,8 @@ model:
   ignore_mismatched_sizes: True
 
 training: # Params per Active Learning Iteration
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
   num_train_epochs: 20 # Fewer epochs per iteration? Or same as baseline? Let's use fewer.
   learning_rate: 6e-5
   weight_decay: 0.01
@@ -30,21 +33,26 @@ training: # Params per Active Learning Iteration
   save_total_limit: 1 # Only keep the best from the current iteration
   load_best_model_at_end: True
   metric_for_best_model: "mean_iou"
-  logging_steps: 20
+  logging_steps: 50
   remove_unused_columns: False
   fp16: True
   push_to_hub: False
 
 active_learning:
-  initial_percentage: 0.3 # Start with 20% of training data
-  increment_percentage: 0.05 # Add 5% each iteration
+  initial_percentage: 0.2 # Start with 20% of training data
+  increment_percentage: 0.20 # Add 5% each iteration
   max_percentage: 1.0 # Go up to 100%
-  sampling_strategy: "bald_diversity" # Could be extended (e.g., "uncertainty")
+  sampling_strategy: "un" # Could be extended (e.g., "uncertainty")
 
 vlm_itl: # Configuration for the VLM-ITL run (can be in the same file or separate)
   enabled: True # Set to True for the VLM-ITL script
   run_name_prefix: "vlm-itl-segformer-b4"
   output_dir_prefix: "./results/vlm_itl"
-  vlm_handler: "huggingface_blip" # Type of VLM handler ('mock', 'huggingface_blip', etc.)
-  vlm_query_template: "Is the primary object in this segmented region correctly identified as {label_name}?"
+  vlm_handler:
+    vlm_type: "huggingface_blip" # Type of VLM handler ('mock', 'huggingface_blip', etc.)
+    vlm_model_name: "Salesforce/blip-vqa-base" # Type of VLM handler ('mock', 'huggingface_blip', etc.)
+    save_vlm_debug_images: True # Save debug images for VLM
+  vlm_query_template: "Is the primary object/objects correctly segmented?"
   eval_subset_size: 0 # skip evaluation for now
+  num_vlm_iterations: 10
+  initial_training_percentage: 0.2

@@ -1,22 +1,19 @@
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import sys
-import argparse
-import logging
 import math
 import random
+import json
+import logging # Ensure logging is imported at the top level
 from functools import partial
-import copy
-from typing import List, Dict, Any
+from typing import Dict, Any, List, Optional # Ensure Optional and List are imported
 
-# Add project root to Python path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, project_root)
-
-import torch
-import torch.nn.functional as F
-import numpy as np
-from tqdm import tqdm
 from PIL import Image
+import torch
+import numpy as np
+from tqdm.auto import tqdm # Added for progress bars
+
 from transformers import (
     TrainingArguments,
     Trainer,
@@ -24,550 +21,421 @@ from transformers import (
     set_seed,
     EarlyStoppingCallback
 )
-from datasets import Dataset, DatasetDict, concatenate_datasets
+from datasets import Dataset, DatasetDict, concatenate_datasets # Ensure Dataset, DatasetDict, concatenate_datasets are imported
+
+# Add project root to Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from utils.config import load_config
-from utils.log_utils import setup_wandb, logger, log_active_learning_summary
-from utils.metrics import compute_metrics_segmentation
-from utils.active_learning import (
-    sample_initial_data,
-    select_next_batch_indices,
-    ActiveLearningProgressCallback,
-    log_vlm_iteration_summary, # Import VLM summary logger
-    feature_extractor_fn,
-    compute_image_uncertainties
+from utils.log_utils import (
+    setup_wandb, 
+    logger, 
+    # log_active_learning_summary, # Not used here
+    # debug_log_and_plot # Not used here
 )
-from utils.vlm import get_vlm_handler, VLMHandler # Import VLM factory and base class
+from utils.metrics import compute_metrics_segmentation
+from utils.vlm import get_vlm_handler, HuggingFaceVLMHandler # Assuming this is where VLM handlers are defined
+from utils.active_learning import ( # For SegmentationImageLoggerCallbackVLM if used
+    # sample_initial_data, 
+    # select_next_batch_indices,
+    # feature_extractor_fn,
+    # ActiveLearningProgressCallback, 
+    SegmentationImageLoggerCallback, # Or a VLM specific version
+    compute_image_uncertainties,
+    mock_compute_image_uncertainties,
+    compute_segmentation_masks,
+    # compute_mean_iou
+)
 from data.pascal_voc import (
     load_pascal_voc_dataset,
     preprocess_data,
-    create_train_val_test_splits,
+    create_train_val_test_splits, 
+    PASCAL_VOC_LABEL_NAMES,
     PASCAL_VOC_ID2LABEL,
     PASCAL_VOC_LABEL2ID,
-    NUM_PASCAL_VOC_LABELS
+    NUM_PASCAL_VOC_LABELS,
+    PASCAL_VOC_IGNORE_INDEX,
+    PASCAL_VOC_BINARY_ID2LABEL,
+    PASCAL_VOC_BINARY_LABEL2ID,
+    NUM_PASCAL_VOC_BINARY_LABELS
 )
 from models.segformer import load_model_for_segmentation
 
-# suppress datasets pillow downcast warning
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="datasets")
-
-# --- Helper function for VLM Feedback Simulation ---
-def simulate_vlm_feedback_on_batch(
-    vlm_handler: VLMHandler,
-    model: torch.nn.Module,
-    batch: Dict[str, Any], # Batch DIRECTLY from the raw dataset (before preprocessing)
-    image_processor: SegformerImageProcessor,
-    config: Dict[str, Any],
-    device: torch.device,
-) -> List[Dict[str, Any]]:
-    """
-    Gets predictions for a raw batch, simulates VLM feedback on each item.
-
-    Args:
-        vlm_handler (VLMHandler): Initialized VLM handler.
-        model (torch.nn.Module): The current segmentation model.
-        batch (Dict[str, Any]): Batch containing raw 'image' and 'mask'.
-        image_processor (SegformerImageProcessor): For preprocessing.
-        config (Dict[str, Any]): Experiment configuration (for VLM settings).
-        device (torch.device): Device for model inference.
-
-    Returns:
-        List[Dict[str, Any]]: List of feedback dictionaries, one per sample in batch.
-    """
-    images = batch[config['dataset']['image_col']] # List of PIL Images
-    gt_masks = batch[config['dataset']['mask_col']] # List of PIL Masks (ground truth)
-    feedback_list = []
-    vlm_query_template = config.get('vlm_itl', {}).get('vlm_query_template', "Is this segmentation correct?")
+# Conditional import for wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
-    # Preprocess batch for model inference
-    preprocess_fn = partial(
-        preprocess_data,
-        image_processor=image_processor,
-        image_col=config['dataset']['image_col'],
-        mask_col=config['dataset']['mask_col']
-    )
-    # Need to handle single items if batch size is 1, map works on lists
-    processed_inputs = preprocess_fn({'image': images, 'mask': gt_masks})
-    pixel_values = []
-    for i in range(len(processed_inputs['pixel_values'])):
-        pixel_values.append(processed_inputs['pixel_values'][i].unsqueeze(0).to(device))
-    pixel_values = torch.cat(pixel_values, dim=0) # Shape: (batch, 3, H, W)
-
-    model.eval() # Set model to evaluation mode
-    with torch.no_grad():
-        outputs = model(pixel_values=pixel_values)
-        logits = outputs.logits # Shape: (batch, num_labels, H/4, W/4)
-
-    # Upsample logits to match input image size (or label size if different)
-    # Note: This assumes labels match the image size after processor's transforms.
-    # If image_processor resizes labels differently, adjust target size.
-    # Let's assume target size matches input image size for simplicity in VLM context.
-    # HACK: Get expected label size from image_processor if possible, else use a default?
-    #       Let's assume we need original image size for VLM usually.
-    #       The logits are H/4, W/4. We need to resize them.
-    original_height, original_width = images[0].size[1], images[0].size[0]
-
-    # Upsample logits to original image size
-    upsampled_logits = torch.nn.functional.interpolate(
-        logits,
-        size=(original_height, original_width),
-        mode="bilinear",
-        align_corners=False,
-    )
-    predicted_mask_tensor = upsampled_logits.argmax(dim=1) # Shape: (batch, H, W)
-
-    # Iterate through batch items for VLM feedback
-    for i in range(len(images)):
-        original_image = images[i]
-        gt_mask_np = processed_inputs["labels"][i].cpu().numpy().astype(np.uint8)
-        gt_mask_pil = gt_masks[i]
-        
-        pred_mask_np = predicted_mask_tensor[i].cpu().numpy().astype(np.uint8)
-        pred_mask_pil = Image.fromarray(pred_mask_np, mode='L')
-        
-        # Find dominant predicted label (excluding background=0 and ignore=255)
-        valid_pred = (pred_mask_np != 255) & (pred_mask_np != 0)
-        pred_labels, pred_counts = np.unique(
-            pred_mask_np[valid_pred],
-            return_counts=True
-        )
-        dominant_pred_label_id = pred_labels[np.argmax(pred_counts)] if len(pred_labels) > 0 else -1
-
-        # Find dominant ground truth label (excluding background=0 and ignore=255)
-        valid_gt = (gt_mask_np != 255) & (gt_mask_np != 0)
-        gt_labels, gt_counts = np.unique(
-            gt_mask_np[valid_gt],
-            return_counts=True
-        )
-        dominant_gt_label_id = gt_labels[np.argmax(gt_counts)] if len(gt_labels) > 0 else -1
-        predicted_label_name = PASCAL_VOC_ID2LABEL.get(dominant_pred_label_id, "unknown")
-        ground_truth_label_name = PASCAL_VOC_ID2LABEL.get(dominant_gt_label_id, "unknown")
-
-        # Get feedback from VLM handler
-        feedback = vlm_handler.get_vlm_feedback(
-            image=original_image,
-            segmentation_mask=pred_mask_pil, # Provide the predicted mask visualization
-            predicted_label_name=predicted_label_name,
-            ground_truth_label_name=ground_truth_label_name,
-            query_template=vlm_query_template
-        )
-        feedback_list.append(feedback)
-
-    model.train() # Set model back to train mode
-    return feedback_list
-
-
-# --- Main Pipeline ---
 def run_vlm_itl_pipeline(config_path: str):
-    """Main function for the VLM-In-The-Loop active learning simulation."""
-    # --- 1. Load Configuration ---
-    logger.info(f"Loading configuration from: {config_path}")
+    # set HF_HOME env variable if not set
+    hf_home = os.getenv("HF_HOME")
+    logging.info(f"HF_HOME: {hf_home}")
+
+    logger.info(f"Starting VLM-In-The-Loop pipeline with config: {config_path}")
     config = load_config(config_path)
 
-    # Check if VLM-ITL is enabled in the config (can reuse AL config)
+    if config["log_with"] == "wandb":
+        setup_wandb(config, project_name=config['project_name'], run_name=config['run_name_prefix'])
+
+    # --- 1. Configuration & Setup ---
     if not config.get('vlm_itl', {}).get('enabled', False):
-        logger.error("VLM-ITL section not enabled in the configuration file. Set 'vlm_itl.enabled = True'.")
+        logger.error("VLM-ITL section not enabled in config. Set 'vlm_itl.enabled = True'.")
         sys.exit(1)
 
-    al_config = config['active_learning']
+    general_config = config
     vlm_config = config['vlm_itl']
-    # Use VLM-specific prefixes if provided, otherwise fallback to AL prefixes
-    run_name_prefix = vlm_config.get('run_name_prefix', config.get('run_name_prefix', 'vlm_itl_run'))
-    output_dir_prefix = vlm_config.get('output_dir_prefix', config.get('output_dir_prefix', './results/vlm_itl'))
+    dataset_config = config['dataset']
+    model_config = config['model']
+    training_config = config['training']
 
-    # --- 2. Setup Seed and VLM Handler ---
-    set_seed(config['seed'])
-    logger.info(f"Global seed set to {config['seed']}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(general_config['seed'])
+    device = torch.device("cuda" if torch.cuda.is_available() and general_config.get('use_cuda', True) else "cpu")
     logger.info(f"Using device: {device}")
+    
+    output_dir_base = vlm_config.get('output_dir', './results/vlm_itl_runs')
+    run_name_suffix = random.randint(1000,9999)
+    run_name = f"{vlm_config.get('run_name_prefix', 'vlm_itl')}_{general_config['seed']}_{run_name_suffix}"
+    output_dir = os.path.join(output_dir_base, run_name)
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Run output will be saved to: {output_dir}")
 
-    logger.info("Initializing VLM Handler...")
+    if general_config.get('wandb_enabled', False) and wandb:
+        setup_wandb(config, run_name, project_name=general_config.get('project_name', 'VLM-ITL-Project'), project_suffix="-vlm_itl")
+    else:
+        logger.info("W&B logging is disabled.")
+
+
+    # --- 2. Initialize VLM Handler (BLIP) ---
+    logger.info("Initializing VLM Handler (HuggingFace BLIP)...")
     try:
-        vlm_handler = get_vlm_handler(config)
-        vlm_handler._load_model()  # Load the VLM model
-        logger.info(f"Using VLM handler: {type(vlm_handler).__name__}")
+        vlm_handler_config = vlm_config.get('vlm_handler', {})
+        vlm_handler_config['debug_dir'] = os.path.join(config['run_name_prefix'], 'vlm_debug')
+        vlm_handler_config['binary_segmentation'] = dataset_config['binary_segmentation']
+        vlm_handler = HuggingFaceVLMHandler(vlm_handler_config)
     except Exception as e:
-        logger.error(f"Failed to initialize VLM handler: {e}", exc_info=True)
+        logger.error(f"Failed to initialize VLM Handler: {e}", exc_info=True)
         sys.exit(1)
 
-    # --- 3. Load and Prepare Full Data (Same as Active Learning baseline) ---
-    logger.info("Loading PASCAL VOC dataset...")
+    # --- 3. Load Raw Data ---
+    logger.info(f"Loading PASCAL VOC dataset: {dataset_config['name']}...")
     raw_datasets = load_pascal_voc_dataset(
-        dataset_name=config['dataset']['name'],
-        cache_dir=config['dataset'].get('cache_dir')
+        dataset_name=dataset_config['name'],
+        cache_dir=dataset_config.get('cache_dir') 
     )
-    logger.info("Creating fixed validation and test sets...")
-    full_train_data, val_dataset, test_dataset = create_train_val_test_splits(
-        raw_datasets['train'],
-        val_percentage=config['dataset'].get('val_split_percentage', 0.1),
-        test_percentage=config['dataset'].get('test_split_percentage', 0.1),
-        seed=config['seed']
-    )
-    logger.info(f"Full Train Data size: {len(full_train_data)}, Val Set size: {len(val_dataset)}, Test Set size: {len(test_dataset)}")
-
+    
     # --- 4. Prepare Image Processor and Preprocessing Function ---
     logger.info("Loading Image Processor...")
     image_processor = SegformerImageProcessor.from_pretrained(
-        config['dataset']['feature_extractor_name'],
-        do_reduce_labels=False
+        dataset_config['feature_extractor_name'],
+        do_reduce_labels=False 
     )
-    preprocess_fn = partial(
+
+    binary_segmentation_task = dataset_config.get('binary_segmentation', False)
+    if binary_segmentation_task:
+        num_labels = NUM_PASCAL_VOC_BINARY_LABELS
+        id2label = PASCAL_VOC_BINARY_ID2LABEL
+        label2id = PASCAL_VOC_BINARY_LABEL2ID
+    else:
+        num_labels = NUM_PASCAL_VOC_LABELS
+        id2label = PASCAL_VOC_ID2LABEL
+        label2id = PASCAL_VOC_LABEL2ID
+
+    logger.info(f"Binary segmentation task: {binary_segmentation_task}")
+
+    shared_preprocess_fn = partial(
         preprocess_data, 
         image_processor=image_processor,
-        image_col=config['dataset']['image_col'], 
-        mask_col=config['dataset']['mask_col']
+        image_col=dataset_config['image_col'],
+        mask_col=dataset_config['mask_col'],
+        binary_segmentation_task=binary_segmentation_task  # Pass the new parameter
     )
-    logger.info("Preprocessing fixed validation and test sets...")
-    processed_val_dataset = val_dataset.map(
-        preprocess_fn, 
-        batched=True, 
-        remove_columns=val_dataset.column_names,
-        batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
-        load_from_cache_file=True # Force reprocessing to avoid cache issues
-        )
-    processed_test_dataset = test_dataset.map(
-        preprocess_fn, 
-        batched=True, 
-        remove_columns=test_dataset.column_names,
-        batch_size=config['training'].get('per_device_eval_batch_size', 8), # Use eval batch size for preprocessing
-        load_from_cache_file=True # Force reprocessing to avoid cache issues)
-    )
-    processed_full_train = full_train_data.map(
-        preprocess_fn, batched=True,
-        remove_columns=full_train_data.column_names,
-        batch_size=config['training']['per_device_train_batch_size'],
-        load_from_cache_file=True
-    )
-    processed_val_dataset.set_format("torch")
-    processed_test_dataset.set_format("torch")
-    processed_full_train.set_format("torch")
-    logger.info("Validation and test sets preprocessing complete.")
-
-    # --- 5. Initialize Active Learning Loop Variables ---
-    overall_metrics = {}
-    all_vlm_feedback = {} # Store VLM feedback per iteration {data_percentage: feedback_list}
-    num_total_train = len(full_train_data)
-    all_train_indices = list(range(num_total_train))
-    random.seed(config['seed'])
-    random.shuffle(all_train_indices)
-
-    current_percentage = al_config['initial_percentage']
-    increment = al_config['increment_percentage']
-    max_percentage = al_config['max_percentage']
     
-    num_initial = math.ceil(num_total_train * current_percentage)
-    current_indices = all_train_indices[:num_initial]
-    remaining_indices = all_train_indices[num_initial:]
+    logger.info("Creating fixed validation and test set indices from raw_datasets['train']...")
+    train_indices, val_indices = create_train_val_test_splits(
+        raw_datasets['train'], 
+        val_percentage=dataset_config.get('val_split_percentage', 0.1),
+        seed=general_config['seed']
+    )
+    
+    logger.info("Preprocessing the entirety of raw_datasets['train'] to create a source for train/val/test splits...")
+    full_dataset = raw_datasets['train'].map(
+        shared_preprocess_fn,
+        batched=True,
+        batch_size=training_config.get('per_device_eval_batch_size', 8),
+        remove_columns=[dataset_config['image_col'], dataset_config['mask_col']],
+        load_from_cache_file=general_config.get('load_from_cache_file', True),
+        desc="Preprocessing raw training data"
+    )
+    full_dataset.set_format("torch", columns=["pixel_values", "labels"])
 
-    al_steps = []
-    p = current_percentage
-    while p <= max_percentage + 1e-6:
-        al_steps.append(int(round(p * 100)))
-        p += increment
-    total_al_steps = len(al_steps)
-    logger.info(f"Planned Active Learning percentages: {al_steps}%")
 
-    # --- 6. Active Learning Loop with VLM Feedback ---
+    processed_train_pool = full_dataset.select(train_indices)
+    processed_val_dataset = full_dataset.select(val_indices)
+    raw_train_data_subset = raw_datasets['train'].select(train_indices)
+    
+    logger.info(f"Processed train pool size: {len(processed_train_pool)}")
+    logger.info(f"Raw train data subset size (for pseudo-labeling source): {len(raw_train_data_subset)}")
+    logger.info(f"Processed validation data size: {len(processed_val_dataset)}")
+
+    initial_train_percentage = vlm_config.get('initial_training_percentage', 0.05)
+    num_initial_samples = math.ceil(initial_train_percentage * len(processed_train_pool))
+    
+    all_indices_for_train_pool = list(range(len(processed_train_pool)))
+    random.shuffle(all_indices_for_train_pool) 
+    
+    current_gt_labeled_indices = sorted(all_indices_for_train_pool[:num_initial_samples])
+    unlabeled_indices = sorted(all_indices_for_train_pool[num_initial_samples:])
+    pseudo_labels_for_indices: Dict[int, Image.Image] = {} 
+
+    logger.info(f"Initial GT labeled set size (from processed pool): {len(current_gt_labeled_indices)}")
+    logger.info(f"Initial unlabeled pool size (from processed pool): {len(unlabeled_indices)}")
+
+    # --- 5. VLM Iteration Loop ---
+    num_vlm_iterations = vlm_config.get('num_vlm_iterations', 5)
+    samples_to_evaluate_certainty_per_iter = vlm_config.get('samples_to_evaluate_certainty_per_iter', 200)
+    samples_to_query_vlm_per_iter = vlm_config.get('samples_to_query_vlm_per_iter', 50)
+    vlm_query_template = vlm_config.get('vlm_query_template', "Is the primary object in this segmented region a {label_name}?")
+    
+
+    logger.info(f"Loading segmentation model")
     current_model = None
-    pseudo_labels: Dict[int, np.ndarray] = {}
-    for i, target_percentage_int in enumerate(al_steps):
-        current_al_step = i + 1
-        current_data_percentage = target_percentage_int / 100.0
+    
+    current_training_indices = current_gt_labeled_indices.copy()
+    for iteration in range(num_vlm_iterations):
+        logger.info(f"--- VLM Iteration {iteration + 1} / {num_vlm_iterations} ---")
         
-        # --- 6a. Propose & Pseudo-Label with VLM ---
-        num_target_samples  = math.ceil(num_total_train * current_data_percentage)
-        num_current_samples = len(current_indices)
-        num_to_add          = max(0, num_target_samples - num_current_samples)
-        logger.info(f"\n--- VLM-ITL Iteration {current_al_step}/{total_al_steps} ---")
+        iter_output_dir = os.path.join(output_dir, f"iteration_{iteration + 1}")
+        os.makedirs(iter_output_dir, exist_ok=True)
         
-        if num_to_add > 0 and remaining_indices:
-            num_to_select = min(num_to_add, len(remaining_indices))
-            logger.info(f"Proposing {num_to_select} new samples for pseudo-labeling using "
-                        f"'{al_config.get('sampling_strategy','random')}' strategy…")
+        # --- 5.A. Prepare Training Data for Current Iteration ---
+        if unlabeled_indices and current_model is not None:
 
-            # 1) Propose a batch from the unlabeled pool
-            uncertainties, model_segmentations = compute_image_uncertainties(
+            segmentations_preds = compute_segmentation_masks(
                 model=current_model,
-                dataset=full_train_data,
-                remaining_indices=remaining_indices,
-                preprocess_fn=preprocess_fn,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                batch_size=al_config.get("inference_batch_size", 8),
+                dataset=processed_train_pool,
+                remaining_indices=unlabeled_indices,
+                device=device,
+                batch_size=training_config.get('per_device_eval_batch_size', 8),
+            )
+        
+            logger.info(f"Segmentation mask preds calculated for {len(unlabeled_indices)} unlabeled samples.")
+            # Pick top-k by descending entropy
+            new_indicies = segmentations_preds.keys()
+            good_indices = []
+            bad_indices  = []
+
+            for idx in new_indicies:
+                # Get the original image and segmentation mask as PIL images
+                original_image = raw_train_data_subset[idx][dataset_config['image_col']]
+                segmentation_mask = Image.fromarray(segmentations_preds[idx].astype(np.uint8))
+                logger.info(f"{processed_train_pool[idx]}")
+                true_mask = raw_train_data_subset[idx][dataset_config['mask_col']]
+                vlm_feed_back = vlm_handler.ask_binary_question(
+                    image = original_image,
+                    segmentation_mask = segmentation_mask,
+                    prompt=vlm_config["vlm_query_template"],
+                    idx=f"{iteration}_{idx}",
+                    true_mask=true_mask,
+                )
+                if vlm_feed_back:
+                    logger.info(f"Dominant class ID: {np.unique(segmentations_preds[idx])}, VLM feedback: {vlm_feed_back}, {idx}")
+                    good_indices.append(idx)
+                else:
+                    bad_indices.append(idx)
+            logger.info(f"{len(good_indices)}/{len(new_indicies)} passed VLM check")
+
+            def _override_mask(example, example_idx):
+                if example_idx in good_indices:
+                    predicted_mask_np = segmentations[example_idx]
+                    
+                    # Convert to PIL Image
+                    pil_mask = Image.fromarray(predicted_mask_np.astype(np.uint8))
+                    
+                    # Resize to the target size used by the image_processor for labels
+                    # image_processor.size is a dict like {'height': H, 'width': W}
+                    # PIL resize takes (width, height)
+                    resized_pil_mask = pil_mask.resize(
+                        (image_processor.size["width"], image_processor.size["height"]),
+                        resample=Image.NEAREST # Use NEAREST for segmentation masks
+                    )
+                    resized_mask_np = np.array(resized_pil_mask)
+                    
+                    return {"labels": resized_mask_np.tolist()}
+                else:
+                    # return no change
+                    return {}
+
+            processed_train_pool = processed_train_pool.map(
+                _override_mask,
+                with_indices=True,
             )
 
-            # Pick top-k by ascending entropy
-            proposals = sorted(
-                uncertainties, key=lambda idx: uncertainties[idx], reverse=False
-            )[:num_to_select]
-
-            logger.info(f"Top-{num_to_select} certain sample indices: {proposals}")
-
-            # 2) Verify each proposal with the VLM
-            accepted, rejected = [], []
-            per_device = config['training']['per_device_eval_batch_size']
-            for start in range(0, len(proposals), per_device):
-                batch_idxs = proposals[start : start + per_device]
-                batch_raw = full_train_data.select(batch_idxs)
-                feedback = simulate_vlm_feedback_on_batch(
-                    vlm_handler,
-                    current_model,
-                    batch_raw,
-                    image_processor,
-                    config,
-                    device
-                )
-                # collect those the VLM “agrees” on
-                for idx, fb in zip(batch_idxs, feedback):
-                    if fb["vlm_agrees_with_gt"] and fb["is_segmentation_correct"]:
-                        accepted.append(idx)
-                    else:
-                        rejected.append(idx)
-
-            logger.info(f"VLM accepted {len(accepted)} samples, rejected {len(rejected)}")
-
-            # 3) Update labeled / unlabeled pools
-            current_indices.extend(accepted)
+            current_training_indices.extend(good_indices)
+            unlabeled_indices = sorted(list(set(unlabeled_indices) - set(good_indices)))
+            logger.info(f"Added {len(good_indices)} auto-labeled samples, kept {len(bad_indices)} still unlabeled.")
             
-            for idx in accepted:
-                pseudo_labels[idx] = model_segmentations[idx]
-
-            remaining_indices = [idx for idx in remaining_indices if idx not in accepted]
-
-            def _inject_pseudo_processed(example, idx):
-                if idx in pseudo_labels:
-                    # your processed_full_train already has example["labels"] at e.g. (H_proc,W_proc)
-                    target_h, target_w = example["labels"].shape
-                    small = pseudo_labels[idx]            # numpy [h_small, w_small]
-                    t = torch.from_numpy(small).unsqueeze(0).unsqueeze(0).float()
-                    up = F.interpolate(t, size=(target_h, target_w), mode="nearest")
-                    if up.squeeze().shape != example["labels"].shape:
-                        logger.warning(f"Shape mismatch: {up.squeeze().shape} vs {example['labels'].shape}")
-                        return {}
-                    return {"labels": up.squeeze().cpu().numpy().astype(np.int64)}
-                return {}
-            try:
-                processed_full_train = processed_full_train.map(
-                    _inject_pseudo_processed,
-                    with_indices=True,
-                    remove_columns=[]
-                )
-            # except wierd pyarrow error
-            except Exception as e:
-                logger.error(f"Error during pseudo-label injection: {e}", exc_info=True)
-                continue
-            
-        elif len(remaining_indices) == 0 and num_to_add > num_current_samples:
-            logger.warning("No more remaining indices to sample from, but target size not reached.")
         
-        logger.warning(f"type of full train: {type(full_train_data)}")
-        current_train_subset_raw = full_train_data.select(current_indices)
-        logger.info(f"Preprocessing training subset ({len(current_train_subset_raw)} samples)...")
-        current_train_subset_processed = current_train_subset_raw.map(
-            preprocess_fn, 
-            batched=True, 
-            remove_columns=current_train_subset_raw.column_names,
-            batch_size=config['training'].get('per_device_train_batch_size', 8), # Use train batch size for preprocessing
-            load_from_cache_file=True # Force reprocessing to avoid cache issues
-        )
-        logger.warning(f"type of preprocessed full train: {type(full_train_data)}")
-        current_train_subset_processed.set_format("torch")
-        logger.warning(f"type of preprocessed full train: {type(full_train_data)}")
-
-        # --- 6b. Setup Model and Trainer (Same as AL baseline) ---
-        if current_model is None:
+        current_training_subset = processed_train_pool.select(current_training_indices)
+        if current_model is None: # First iteration
             logger.info("Loading initial model...")
             current_model = load_model_for_segmentation(
-                model_name_or_path=config['model']['name'], num_labels=NUM_PASCAL_VOC_LABELS,
-                id2label=PASCAL_VOC_ID2LABEL, label2id=PASCAL_VOC_LABEL2ID,
+                model_name_or_path=config['model']['name'],
+                num_labels=num_labels,
+                id2label=id2label,
+                label2id=label2id,
                 ignore_mismatched_sizes=config['model'].get('ignore_mismatched_sizes', False)
-            ).to(device) # Move model to device
-        else:
-            logger.info("Re-using model from previous iteration.")
-            current_model.to(device) # Ensure model is on correct device
+            )
+        current_model.to(device)
 
-        iter_output_dir = f"{output_dir_prefix}_iter_{target_percentage_int}"
-        iter_run_name = f"{run_name_prefix}_{target_percentage_int}pct"
-        os.makedirs(iter_output_dir, exist_ok=True)
-
-        iteration_config = copy.deepcopy(config)
-        iteration_config['active_learning']['current_percentage'] = current_data_percentage
-        iteration_config['active_learning']['current_step'] = current_al_step
-        setup_wandb(iteration_config, run_name=iter_run_name, project_name=config.get('project_name'))
+        iter_training_args_output_dir = os.path.join(iter_output_dir, "training_checkpoints")
+        os.makedirs(iter_training_args_output_dir, exist_ok=True)
 
         iter_training_args = TrainingArguments(
-            output_dir=str(iter_output_dir),
-            run_name=str(iter_run_name),
-
-            # ints
-            num_train_epochs=int(config['training']['num_train_epochs']),
-            per_device_train_batch_size=int(config['training']['per_device_train_batch_size']),
-            per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
-            save_total_limit=int(config['training']['save_total_limit']),
-            logging_steps=int(config['training']['logging_steps']),
-            seed=int(config['seed']),
-
-            # floats
-            learning_rate=float(config['training']['learning_rate']),
-            weight_decay=float(config['training']['weight_decay']),
-
-            # strings
-            eval_strategy=str(config['training']['evaluation_strategy']),
-            save_strategy=str(config['training']['save_strategy']),
-            metric_for_best_model=str(config['training']['metric_for_best_model']),
-
-            # booleans
-            load_best_model_at_end=bool(config['training']['load_best_model_at_end']),
-            remove_unused_columns=bool(config['training'].get('remove_unused_columns', False)),
-            fp16=bool(config['training'].get('fp16', False) and torch.cuda.is_available()),
-
-            # logging / reporting
+            output_dir=iter_training_args_output_dir,
+            num_train_epochs=training_config.get('num_train_epochs', 3),
+            per_device_train_batch_size=training_config['per_device_train_batch_size'],
+            per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
+            save_strategy=training_config.get("save_strategy_per_iter", "epoch"),
+            eval_strategy=training_config.get("evaluation_strategy_per_iter", "epoch"),
+            logging_steps=training_config.get('logging_steps', 50),
+            learning_rate=training_config.get('learning_rate_per_iter', 5e-5),
+            weight_decay=training_config.get('weight_decay', 0.01),
+            metric_for_best_model=training_config.get('metric_for_best_model', 'eval_mean_iou'),
+            load_best_model_at_end=training_config.get('load_best_model_at_end_per_iter', True),
+            remove_unused_columns=False,
+            fp16=training_config.get('fp16', False) and torch.cuda.is_available(),
+            report_to=general_config['log_with'],
+            seed=general_config['seed'],
             logging_dir=os.path.join(iter_output_dir, 'logs'),
-            logging_first_step=True,
-            report_to=[x.strip() for x in str(config.get('log_with', 'none')).split(',') if x.strip()],
+            disable_tqdm=general_config.get('disable_tqdm', False),
+            push_to_hub=False,
+            run_name=run_name,
+        )
 
-            # never push these interim checkpoints
-            push_to_hub=False
+        compute_metrics_fn = partial(
+            compute_metrics_segmentation,
+            num_labels=num_labels,
+            ignore_index=255
         )
-        compute_metrics_fn = partial(compute_metrics_segmentation, num_labels=NUM_PASCAL_VOC_LABELS, ignore_index=255)
-        al_progress_callback = ActiveLearningProgressCallback(
-            total_al_steps, 
-            current_al_step, 
-            current_data_percentage,
-            number_of_samples=len(current_indices),
-            total_number_of_samples=num_total_train,
-        )
-        early_stopping_callback = EarlyStoppingCallback(
-            config['training'].get('early_stopping_patience', 3), config['training'].get('early_stopping_threshold', 0.0)
-        )
+                    
+        callbacks = []
+        if training_config.get('early_stopping_patience_per_iter', 0) > 0 :
+                callbacks.append(EarlyStoppingCallback(
+                    early_stopping_patience=training_config['early_stopping_patience_per_iter'],
+                    early_stopping_threshold=training_config.get('early_stopping_threshold_per_iter', 0.0)
+                ))
+            
         trainer = Trainer(
-            model=current_model, args=iter_training_args,
-            train_dataset=current_train_subset_processed, eval_dataset=processed_val_dataset,
-            compute_metrics=compute_metrics_fn, callbacks=[al_progress_callback, early_stopping_callback]
+            model=current_model,
+            args=iter_training_args,
+            train_dataset=current_training_subset,
+            eval_dataset=processed_val_dataset,
+            compute_metrics=compute_metrics_fn,
+            callbacks=callbacks if callbacks else None,
         )
 
-        # --- 6c. Train Model (Same as AL baseline) ---
-        logger.info(f"Starting training for {target_percentage_int}% data...")
-        try:
-            trainer.train()
-            logger.info(f"Training finished for {target_percentage_int}% data.")
-        except Exception as e:
-            logger.error(f"Training failed at iteration {current_al_step} ({target_percentage_int}%): {e}", exc_info=True)
-            break
+        logger.info(f"Starting training for VLM iteration {iteration + 1}...")
+        train_result = trainer.train()
+        logger.info(f"Training finished for iteration {iteration + 1}. Metrics: {train_result.metrics}")
+        
+        current_model = trainer.model 
+        model_save_path = os.path.join(iter_output_dir, "best_model_from_iter")
+        current_model.save_pretrained(model_save_path)
+        logger.info(f"Saved model from iteration {iteration+1} to {model_save_path}")
 
-        # --- 6d. Evaluate and Log Metrics (Standard Evaluation) ---
-        logger.info(f"Evaluating model on FIXED validation set (after {target_percentage_int}% training)...")
+
+        logger.info(f"Evaluating model from iteration {iteration + 1} on validation set...")
         eval_metrics = trainer.evaluate(eval_dataset=processed_val_dataset)
-        logger.info(f"Validation Metrics ({target_percentage_int}% data): {eval_metrics}")
-        metrics_to_store = {k: v for k, v in eval_metrics.items() if isinstance(v, (int, float))}
-        overall_metrics[target_percentage_int] = metrics_to_store
+        logger.info(f"Validation Metrics (Iter {iteration + 1}): {eval_metrics}")
 
-        # --- 6e. Simulate and Log VLM Feedback ---
-        # We simulate VLM feedback *after* training for this iteration, using the trained model.
-        # This simulates a human (or VLM) reviewing the model's performance at this stage.
-        logger.info(f"Simulating VLM feedback on a sample of the validation set...")
-        # Use a subset of validation data for VLM feedback simulation to save time/cost
-        vlm_eval_subset_size = vlm_config.get('eval_subset_size', 100) # Number of samples for VLM eval
-        vlm_eval_subset_size = min(vlm_eval_subset_size, len(val_dataset))
-        if vlm_eval_subset_size > 0:
-            # Select a random subset of the *raw* validation data
-            vlm_eval_indices = random.sample(range(len(val_dataset)), vlm_eval_subset_size)
-            vlm_eval_subset_raw = val_dataset.select(vlm_eval_indices)
+        logger.info("-"*50)
+        logger.info(f"End of VLM Iteration {iteration + 1}:")
+        logger.info(f"  Original GT Labeled samples count: {len(current_gt_labeled_indices)}")
+        logger.info(f"  VLM-confirmed pseudo-labeled samples count: {len(current_training_indices)}")
+        logger.info(f"  Unlabeled samples remaining for query: {len(unlabeled_indices)}")
+        if general_config.get('wandb_enabled', False) and wandb:
+            wandb.log({
+                f"iter_{iteration+1}_dataset/original_gt_sample_count": len(current_gt_labeled_indices),
+                f"iter_{iteration+1}_dataset/vlm_confirmed_pseudo_sample_count": len(pseudo_labels_for_indices),
+                f"iter_{iteration+1}_dataset/unlabeled_sample_for_query_count": len(unlabeled_indices),
+            }, step=iteration+1)
 
-            iteration_vlm_feedback = []
-            # Process in batches for efficiency
-            batch_size = config['training']['per_device_eval_batch_size']
-            for i in tqdm(range(0, len(vlm_eval_subset_raw), batch_size), desc="VLM Feedback Sim"):
-                batch_raw = vlm_eval_subset_raw[i : i + batch_size] # Dict[str, List]
-                feedback = simulate_vlm_feedback_on_batch(
-                    vlm_handler, current_model, batch_raw, image_processor, config, device
-                )
-                iteration_vlm_feedback.extend(feedback)
-
-            all_vlm_feedback[target_percentage_int] = iteration_vlm_feedback
-            # Log summary stats for this iteration's VLM feedback
-            log_vlm_iteration_summary(iteration_vlm_feedback, target_percentage_int)
-        else:
-             logger.info("Skipping VLM feedback simulation as eval_subset_size is 0.")
-
-
-        # --- 6f. Update model and finish iteration ---
-        current_model = trainer.model # Keep the best model from this iteration
-        if config.get('log_with') == 'wandb' and trainer.is_world_process_zero():
-            import wandb
-            wandb.log({f"final_eval_{k}": v for k, v in eval_metrics.items()})
-            # Optionally log VLM summary table for the iteration here if needed
-            wandb.finish()
-
-    # --- 7. Final Evaluation on Test Set (Same as AL baseline) ---
-    if current_model and processed_test_dataset:
+    # --- 6. Final Evaluation on Test Set ---
+    if current_model and processed_test_dataset and len(processed_test_dataset) > 0:
         logger.info("\n--- Final Evaluation on FIXED Test Set ---")
-        final_output_dir = os.path.join(output_dir_prefix, "final")
-        os.makedirs(final_output_dir, exist_ok=True)
+        final_eval_output_dir = os.path.join(output_dir, "final_evaluation")
+        os.makedirs(final_eval_output_dir, exist_ok=True)
+
         final_eval_args = TrainingArguments(
-            output_dir=final_output_dir, 
-            per_device_eval_batch_size=config['training']['per_device_eval_batch_size'],
-            fp16=config['training'].get('fp16', False) and torch.cuda.is_available(), 
-            report_to="none", 
+            output_dir=final_eval_output_dir,
+            per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
+            fp16=training_config.get('fp16', False) and torch.cuda.is_available(),
+            report_to="none",
             remove_unused_columns=False,
         )
-        final_trainer = Trainer(model=current_model, args=final_eval_args, compute_metrics=compute_metrics_fn)
+        final_trainer = Trainer(
+            model=current_model,
+            args=final_eval_args,
+            eval_dataset=processed_test_dataset,
+            compute_metrics=compute_metrics_fn, # Defined earlier
+        )
         test_metrics = final_trainer.evaluate(eval_dataset=processed_test_dataset)
         logger.info(f"Final Test Set Metrics: {test_metrics}")
-        final_trainer.save_model(os.path.join(final_output_dir, "final_model"))
-        final_trainer.save_metrics("eval", test_metrics)
-        logger.info(f"Final model saved to {os.path.join(final_output_dir, 'final_model')}")
 
-        # --- 8. Log Final Summary (including VLM info) ---
-        if config.get('log_with') == 'wandb':
-            summary_run_name = f"{run_name_prefix}_summary"
-            summary_run = setup_wandb(config, run_name=summary_run_name, project_name=config.get('project_name'))
-            if summary_run:
-                wandb.log({"final_test_metrics": test_metrics})
-                log_active_learning_summary(overall_metrics, config) # Log standard AL metrics plot
+        final_model_path = os.path.join(output_dir, "final_model_from_vlm_itl")
+        current_model.save_pretrained(final_model_path)
+        
+        test_metrics_path = os.path.join(final_eval_output_dir, "test_results.json")
+        with open(test_metrics_path, "w") as f:
+            json.dump(test_metrics, f, indent=4)
+        logger.info(f"Final model saved to {final_model_path}")
+        logger.info(f"Final test metrics saved to {test_metrics_path}")
 
-                # Log overall VLM feedback summary (e.g., agreement rate vs data %)
-                if all_vlm_feedback:
-                    vlm_summary_metrics = {}
-                    for percentage, feedback_list in sorted(all_vlm_feedback.items()):
-                        num = len(feedback_list)
-                        if num > 0:
-                            agree_rate = sum(f['vlm_agrees_with_gt'] for f in feedback_list) / num
-                            actual_acc = sum(f['is_segmentation_correct'] for f in feedback_list) / num
-                            vlm_summary_metrics[percentage] = {
-                                'vlm_agreement_rate': agree_rate,
-                                'actual_accuracy_sampled': actual_acc,
-                                'vlm_samples_evaluated': num
-                            }
-                    # Use the existing logger function with a different metrics dict
-                    log_active_learning_summary(vlm_summary_metrics, config) # Reuse plotting logic
+        if general_config.get('wandb_enabled', False) and wandb:
+            wandb.log({"final_test/mean_iou": test_metrics.get('eval_mean_iou', 0.0), # Log specific key metrics
+                       "final_test/accuracy": test_metrics.get('eval_accuracy', 0.0)}) 
+            # Log all test metrics
+            for k, v in test_metrics.items():
+                wandb.summary[f"final_test_{k.replace('eval_','')}"] = v
 
-                wandb.finish()
 
     elif not current_model:
-        logger.error("VLM-ITL loop did not produce a final model. Skipping final evaluation.")
-    else:
-        logger.warning("No test set available. Skipping final evaluation.")
+         logger.error("VLM-ITL loop did not produce a final model. Skipping final evaluation.")
+    else: 
+         logger.warning("No test set available or processed test set is empty. Skipping final evaluation.")
 
-    logger.info("VLM-ITL simulation script finished.")
+    if general_config.get('wandb_enabled', False) and wandb and wandb.run:
+        wandb.finish()
+    logger.info("VLM-ITL pipeline finished.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run VLM-In-The-Loop Active Learning Simulation")
+    # Argument parsing should be here, similar to train_active_learning_overlap.py
+    # For now, assume config path is hardcoded or passed directly for testing.
+    # Example:
+    # config_file_path = 'configs/vlm_itl_config.yaml' 
+    # run_vlm_itl_pipeline(config_file_path)
+
+    # Using argparse like in the other script:
+    import argparse # Make sure argparse is imported
+    parser = argparse.ArgumentParser(description="Run VLM-In-The-Loop pipeline for Image Segmentation")
     parser.add_argument(
         "--config",
         type=str,
-        # required=True,
-        default="configs/vlm_itl_config.yaml",
-        help="Path to the configuration YAML file (should include vlm_itl settings)."
+        default='configs/vlm_itl_config.yaml', # Default config path
+        help="Path to the VLM-ITL configuration YAML file."
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
-    run_vlm_itl_pipeline(args.config) # for proper debug failure
-    # try:
-    #     run_vlm_itl_pipeline(args.config)
-    # except Exception as e:
-    #     logger.error("An error occurred during the VLM-ITL pipeline.", exc_info=True)
-    #     sys.exit(1)
+    # Setup basic logging if not already configured by logger setup
+    logging.basicConfig(
+        level=logging.INFO, # Changed to INFO to see more details by default
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    
+    run_vlm_itl_pipeline(args.config)
