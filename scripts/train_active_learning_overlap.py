@@ -54,7 +54,10 @@ from data.pascal_voc import (
     PASCAL_VOC_LABEL_NAMES,
     PASCAL_VOC_ID2LABEL,
     PASCAL_VOC_LABEL2ID,
-    NUM_PASCAL_VOC_LABELS
+    NUM_PASCAL_VOC_LABELS,
+    PASCAL_VOC_BINARY_ID2LABEL,
+    PASCAL_VOC_BINARY_LABEL2ID,
+    NUM_PASCAL_VOC_BINARY_LABELS
 )
 from models.segformer import load_model_for_segmentation
 
@@ -91,6 +94,7 @@ def run_active_learning_pipeline(config_path: str):
     logger.info(f"Loading configuration from: {config_path}")
     config = load_config(config_path)
     al_config = config['active_learning']
+    dataset_config = config['dataset']
     run_name_prefix = config.get('run_name_prefix', 'al_run')
     output_dir_prefix = config.get('output_dir_prefix', './results/active_learning')
 
@@ -108,11 +112,10 @@ def run_active_learning_pipeline(config_path: str):
     )
     
     logger.info("Creating fixed validation and test sets...")
-    train_indices, val_indices, test_indices = create_train_val_test_splits(
+    train_indices, val_indices = create_train_val_test_splits(
         raw_dataset['train'],
         # raw_dataset, # here, load_dataset returns a DatasetDict instead of a Dataset
         val_percentage=config['dataset'].get('val_split_percentage', 0.1),
-        test_percentage=config['dataset'].get('test_split_percentage', 0.1),
         seed=config['seed'] # Use the global seed for splitting
     )
 
@@ -123,12 +126,25 @@ def run_active_learning_pipeline(config_path: str):
         config['dataset']['feature_extractor_name'],
         do_reduce_labels=False
     )
-    # Create partial preprocessing function ONCE
+    
+    binary_segmentation_task = dataset_config.get('binary_segmentation', False)
+    if binary_segmentation_task:
+        num_labels = NUM_PASCAL_VOC_BINARY_LABELS
+        id2label = PASCAL_VOC_BINARY_ID2LABEL
+        label2id = PASCAL_VOC_BINARY_LABEL2ID
+    else:
+        num_labels = NUM_PASCAL_VOC_LABELS
+        id2label = PASCAL_VOC_ID2LABEL
+        label2id = PASCAL_VOC_LABEL2ID
+
+    logger.info(f"Binary segmentation task: {binary_segmentation_task}")
+
     preprocess_fn = partial(
-        preprocess_data,
+        preprocess_data, 
         image_processor=image_processor,
-        image_col=config['dataset']['image_col'],
-        mask_col=config['dataset']['mask_col']
+        image_col=dataset_config['image_col'],
+        mask_col=dataset_config['mask_col'],
+        binary_segmentation_task=binary_segmentation_task  # Pass the new parameter
     )
     
     # Preprocess the full dataset
@@ -143,11 +159,18 @@ def run_active_learning_pipeline(config_path: str):
     full_dataset.set_format("torch", columns=["pixel_values", "labels"])
     logger.info(f"Full dataset size: {len(full_dataset)}")
     
+    test_dataset = raw_dataset['test'].map(
+        preprocess_fn,
+        batched=True,
+        batch_size=config['dataset'].get('batch_size', 16),
+        remove_columns=[config['dataset']['image_col'], config['dataset']['mask_col']],
+        load_from_cache_file=True,
+    )
+    
     # Split the dataset into train, validation, and test sets
     full_dataset_dict = DatasetDict({
         'train': full_dataset.select(train_indices),
         'validation': full_dataset.select(val_indices),
-        'test': full_dataset.select(test_indices)
     })
     
     # --- 5. Initialize Active Learning Loop Variables (already done) ---
@@ -158,9 +181,8 @@ def run_active_learning_pipeline(config_path: str):
     random.shuffle(all_train_indices)  # Consistent random sampling
 
     # Initial AL config parameters
-    current_percentage, increment, max_percentage = sanity_check_percentages(
+    current_percentage, max_percentage = sanity_check_percentages(
         al_config['initial_percentage'], 
-        al_config['increment_percentage'], 
         al_config['max_percentage']
     )
 
@@ -171,6 +193,7 @@ def run_active_learning_pipeline(config_path: str):
     empty_iterations_count = 0
     iteration = 1
     current_model = None  # Model will be loaded in the loop
+    good_indices, bad_indices = None, None
     current_data_percentage = None
     miou_metric = MeanIoU(
         num_classes=NUM_PASCAL_VOC_LABELS, 
@@ -249,7 +272,7 @@ def run_active_learning_pipeline(config_path: str):
                 empty_iterations_count += 1
                 logger.info("No new samples met the IoU threshold in this iteration.")
                 
-        added = len(good_indices) if good_indices else 0
+        added = len(good_indices) if good_indices else num_initial
         logger.info(f"Added {added} samples in this iteration.")
                 
         current_percentage = min(max_percentage, (len(current_indices) / num_total_train) * 100.0)
@@ -265,9 +288,9 @@ def run_active_learning_pipeline(config_path: str):
             logger.info("Loading initial model...")
             current_model = load_model_for_segmentation(
                 model_name_or_path=config['model']['name'],
-                num_labels=NUM_PASCAL_VOC_LABELS,
-                id2label=PASCAL_VOC_ID2LABEL,
-                label2id=PASCAL_VOC_LABEL2ID,
+                num_labels=num_labels,
+                id2label=id2label,
+                label2id=label2id,
                 ignore_mismatched_sizes=config['model'].get('ignore_mismatched_sizes', False)
             )
         else:
@@ -358,7 +381,7 @@ def run_active_learning_pipeline(config_path: str):
         iteration += 1
 
     # --- 7. Final Evaluation on Test Set (using the model from the last iteration) ---
-    if current_model and full_dataset_dict['test']:
+    if current_model and test_dataset:
         logger.info("\n--- Final Evaluation on FIXED Test Set ---")
         # Need a final Trainer instance for evaluation if the last one is out of scope
         # Or just use the last trainer instance if available
@@ -376,10 +399,10 @@ def run_active_learning_pipeline(config_path: str):
         final_trainer = Trainer(
             model=current_model, # Use the final best model from the loop
             args=final_eval_args,
-            eval_dataset=full_dataset_dict['test'],
+            eval_dataset=test_dataset,
             compute_metrics=compute_metrics_fn,
         )
-        test_metrics = final_trainer.evaluate(eval_dataset=full_dataset_dict['test'])
+        test_metrics = final_trainer.evaluate(eval_dataset=test_dataset)
         logger.info(f"Final Test Set Metrics: {test_metrics}")
 
         # Save final model and test metrics

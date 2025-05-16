@@ -13,6 +13,7 @@ dataset:
   val_split_percentage: 0.1 # Use 10% of train as validation (fixed across iterations)
   test_split_percentage: 0.1 # Use 10% of train as test (fixed across iterations)
   load_from_cache_file: False # Set to True to use cached dataset
+  binary_segmentation: True # Set to True for binary segmentation
 
 model:
   name: "nvidia/segformer-b0-finetuned-ade-512-512"
@@ -22,7 +23,7 @@ model:
 training: # Params per Active Learning Iteration
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
-  num_train_epochs: 20 # Fewer epochs per iteration? Or same as baseline? Let's use fewer.
+  num_train_epochs: 10 # Fewer epochs per iteration? Or same as baseline? Let's use fewer.
   learning_rate: 6e-5
   weight_decay: 0.01
   evaluation_strategy: "epoch"
@@ -43,8 +44,7 @@ training: # Params per Active Learning Iteration
   early_stopping_threshold: 0.001 # Early stopping threshold
 
 active_learning:
-  initial_percentage: 0.2 # Start with 20% of training data
-  increment_percentage: 0.2 # Add 20% each iteration
+  initial_percentage: 0.05 # Start with 20% of training data
   max_percentage: 1.0 # Go up to 100%
   sampling_strategy: "min_entropy" # Options: "random", "min_entropy", "max_entropy"
   iou_threshold: 0.6 # for entropy sampling

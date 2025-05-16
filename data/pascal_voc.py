@@ -1,5 +1,5 @@
-from dotenv import load_dotenv
-load_dotenv()
+# from dotenv import load_dotenv
+# load_dotenv()
 from datasets import load_dataset, Dataset, DatasetDict
 from transformers import SegformerImageProcessor
 from typing import Dict, Any, Tuple, Optional, List
