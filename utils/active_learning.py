@@ -52,12 +52,13 @@ def compute_image_uncertainties(
     remaining_indices: List[int],
     preprocess_fn,
     device,
-    batch_size: int = 8
+    batch_size: int = 8,
+    return_tensor: bool = False
 ) -> Tuple[Dict[int, float], Dict[int, np.ndarray]]:
     """
     Returns:
       uncertainties: idx -> mean-per-pixel entropy
-      model_segmentations: idx -> HxW numpy mask of model’s argmax
+      model_segmentations: idx -> HxW numpy mask of models argmax
     """
     model.to(device)
     model.eval()
@@ -102,7 +103,23 @@ def compute_image_uncertainties(
                 uncertainties[orig_idx] = score
 
                 # grab the argmax mask and move it to CPU + numpy
-                seg_mask = logits[i].argmax(dim=0).cpu().numpy()  # [H,W]
+                if not return_tensor:
+                    seg_mask = logits[i].argmax(dim=0).cpu().numpy()  # [H,W]
+                    orig_h, orig_w = pix[i].shape[1], pix[i].shape[2]
+                    if seg_mask.shape != pix[i].shape[1:]:
+                        # if the seg_mask is not the same size as the original image, resize it
+                        seg_mask = np.array(Image.fromarray(seg_mask.astype(np.uint8)).resize((orig_w, orig_h), Image.NEAREST))
+                    seg_mask = seg_mask.astype(np.uint8)
+                else:
+                    seg_mask = logits[i].argmax(dim=0) # keep as tensor for now
+                    # if the seg_mask is not the same size as the original image, resize it
+                    if seg_mask.shape != pix[i].shape[1:]:
+                        seg_mask = torch.nn.functional.interpolate(
+                            seg_mask.unsqueeze(0).unsqueeze(0).float(),
+                            size=pix[i].shape[1:],
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze().long()
                 model_segmentations[orig_idx] = seg_mask
 
     return uncertainties, model_segmentations
@@ -367,7 +384,7 @@ class ActiveLearningProgressCallback(TrainerCallback):
         """Optionally log AL progress at epoch end too."""
         if state.is_world_process_zero:
             epoch_log = {
-                "al_step": f"{self.current_al_step}/{self.total_al_steps}",
+                # "al_step": f"{self.current_al_step}/{self.total_al_steps}",
                 "al_data_percentage": self.current_data_percentage,
                 "num_samples": self.number_of_samples, # Log number of samples in AL step
                 "total_num_samples": self.total_number_of_samples, # Log total number of samples

@@ -4,11 +4,18 @@ import argparse
 import logging
 import math
 import random
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="datasets")
+warnings.filterwarnings("ignore", category=FutureWarning, module="datasets")
+# warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+warnings.filterwarnings("ignore", category=UserWarning, module="accelerate")
 from functools import partial
 from typing import Dict, Any, List
 import copy # To deep copy config for modifications per iteration
 import torch
 import numpy as np
+from tqdm import tqdm
 from transformers import (
     TrainingArguments,
     Trainer,
@@ -17,6 +24,7 @@ from transformers import (
     EarlyStoppingCallback
 )
 from datasets import Dataset, DatasetDict, concatenate_datasets
+from torchmetrics.segmentation import MeanIoU # type: ignore
 
 # Add project root to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -49,6 +57,33 @@ from data.pascal_voc import (
     NUM_PASCAL_VOC_LABELS
 )
 from models.segformer import load_model_for_segmentation
+
+def sanity_check_percentages(current_percentage: float, increment: float, max_percentage: float) -> tuple[float, float, float]:
+    """Perform sanity checks on the percentage values."""
+    # Ensure percentages are in the range [0, 100]
+    if current_percentage < 1.0:
+        logger.debug(f"Converting current_percentage from {current_percentage} to {current_percentage * 100}")
+        current_percentage *= 100
+    if increment < 1.0:
+        logger.debug(f"Converting increment from {increment} to {increment * 100}")
+        increment *= 100
+    if max_percentage < 100:
+        logger.debug(f"Converting max_percentage from {max_percentage} to {max_percentage * 100}")
+        max_percentage *= 100
+    if current_percentage > max_percentage:
+        raise ValueError(f"Current percentage ({current_percentage}) cannot exceed max percentage ({max_percentage}).")
+    if max_percentage > 100:
+        raise ValueError("Max percentage cannot exceed 100.")
+    if increment <= 0:
+        raise ValueError("Increment percentage must be positive.")
+    if current_percentage <= 0:
+        raise ValueError("Initial percentage must be positive.")
+    if max_percentage <= 0:
+        raise ValueError("Max percentage must be positive.")
+    if current_percentage > 100:
+        raise ValueError("Initial percentage cannot exceed 100.")
+    
+    return current_percentage, increment, max_percentage
 
 def run_active_learning_pipeline(config_path: str):
     """Main function for the active learning simulation script."""
@@ -115,52 +150,40 @@ def run_active_learning_pipeline(config_path: str):
         'test': full_dataset.select(test_indices)
     })
     
-    # --- 5. Initialize Active Learning Loop Variables ---
-    overall_metrics = {} # Store metrics per iteration {data_percentage: metrics_dict}
+    # --- 5. Initialize Active Learning Loop Variables (already done) ---
+    overall_metrics = {}  # Store metrics per iteration
     num_total_train = len(full_dataset_dict['train'])
     logger.info(f"Total training samples: {num_total_train}")
     all_train_indices = list(range(num_total_train))
-    random.seed(config['seed']) # Re-seed before shuffling for sampling consistency if needed
-    random.shuffle(all_train_indices) # Shuffle indices for random sampling pool
+    random.shuffle(all_train_indices)  # Consistent random sampling
 
-    current_percentage = al_config['initial_percentage']
-    increment = al_config['increment_percentage']
-    max_percentage = al_config['max_percentage']
+    # Initial AL config parameters
+    current_percentage, increment, max_percentage = sanity_check_percentages(
+        al_config['initial_percentage'], 
+        al_config['increment_percentage'], 
+        al_config['max_percentage']
+    )
 
-    num_initial = math.ceil(num_total_train * current_percentage)
+    num_initial = math.ceil(num_total_train * (current_percentage/100.0))
     current_indices = all_train_indices[:num_initial]
     remaining_indices = all_train_indices[num_initial:]
 
-    # Determine number of AL steps
-    al_steps = []
-    p = current_percentage
-    while p <= max_percentage + 1e-6: # Add tolerance for float comparison
-        al_steps.append(int(round(p * 100))) # Store percentage integer (e.g., 10, 20)
-        p += increment
-    total_al_steps = len(al_steps)
-    logger.info(f"Planned Active Learning percentages: {al_steps}%")
-
-    # --- 6. Active Learning Loop ---
-    current_model = None # Variable to hold the model between iterations
-    for i, target_percentage_int in enumerate(al_steps):
-        current_al_step = i + 1
-        current_data_percentage = target_percentage_int / 100.0
-
-        # --- 6a. Prepare Data for Current Iteration ---
-        num_target_samples = math.ceil(num_total_train * current_data_percentage)
-        num_current_samples = len(current_indices)
-        num_to_add = max(0, num_target_samples - num_current_samples)
-
-        logger.info(f"\n--- Active Learning Iteration {current_al_step}/{total_al_steps} ---")
-        logger.info(f"Target Data: {target_percentage_int}% ({num_target_samples} samples)")
-        logger.info(f"Current Data: {num_current_samples} samples")
-
-        # --- 6a. Active Learning Sampling (entropy-based) ---
-        if num_to_add > 0 and remaining_indices:
-            k = min(num_to_add, len(remaining_indices))
-            logger.info(f"Selecting {k} new samples via entropy sampling…")
-
-            # Only score the *remaining* (unlabeled) pool
+    empty_iterations_count = 0
+    iteration = 1
+    current_model = None  # Model will be loaded in the loop
+    current_data_percentage = None
+    miou_metric = MeanIoU(
+        num_classes=NUM_PASCAL_VOC_LABELS, 
+        per_class=False, 
+        include_background=False, 
+        input_format="index"
+    )
+    added = num_initial
+    # --- 6. Active Learning Loop (while loop) ---
+    while remaining_indices and empty_iterations_count < 2 and added > 5:
+        logger.info(f"\n--- Active Learning Iteration {iteration} ---")
+        
+        if iteration > 1:
             uncertainties, segmentations = compute_image_uncertainties(
                 model=current_model,
                 dataset=full_dataset_dict['train'],
@@ -168,68 +191,77 @@ def run_active_learning_pipeline(config_path: str):
                 preprocess_fn=preprocess_fn,
                 device="cuda" if torch.cuda.is_available() else "cpu",
                 batch_size=al_config.get("inference_batch_size", 8),
+                # return_tensor=True,
+                return_tensor=False,
             )
 
-            # Pick top-k by descending entropy
+            # Pick top-k indices by entropy (adjust reverse as needed)
             new_indices = sorted(
                 uncertainties, 
                 key=lambda idx: uncertainties[idx], 
-                reverse=False if al_config.get("min_entropy", False) else True,
-                # sort by ascending entropy instead for min_entropy
-                # reverse=True, 
-            )[:k]
+                reverse=False if al_config.get("min_entropy", False) else True
+            # )[:k] # use all indices for now
+            )
 
-            # 1) Threshold the IoU
+            # Threshold using mean IoU
             iou_thresh = al_config.get("iou_threshold", 0.8)
             good_indices = []
             bad_indices  = []
-
-            for idx in new_indices:
-                true_mask = full_dataset_dict["train"][idx]["labels"]           # numpy array of shape [H,W]
-                pred_mask = segmentations[idx]                          # your model’s numpy [H,W]
-                miou = compute_mean_iou(true_mask, pred_mask)
-                logger.info(f"  idx={idx}  mean IoU = {miou:.3f}")
+            for idx in tqdm(new_indices, desc="Evaluating mIoU", unit="sample"):
+                true_mask = full_dataset_dict["train"][idx]["labels"]  # numpy array [H,W]
+                pred_mask = segmentations[idx]
+                if type(pred_mask) != torch.Tensor:
+                    pred_mask_cp = pred_mask.copy()  # numpy array [H,W]
+                    miou = compute_mean_iou(true_mask, pred_mask_cp)
+                elif type(pred_mask) == torch.Tensor:
+                    pred_mask_cp = pred_mask.clone() # torch tensor for torchmetrics miou
+                    miou = miou_metric(
+                        pred_mask, 
+                        true_mask
+                    )
+                else:
+                    raise ValueError(f"Unknown type for pred_mask: {type(pred_mask)}")
+                
                 if miou >= iou_thresh:
-                    good_indices.append(idx)
+                    good_indices.append(idx) 
                 else:
                     bad_indices.append(idx)
 
             logger.info(f"{len(good_indices)}/{len(new_indices)} passed IoU ≥ {iou_thresh}")
 
-            # 2)  Override the true masks *in place* for just those good examples:
-            def _override_mask(example, example_idx):
-                if example_idx in good_indices:
-                    # turn the H×W numpy array into a list of lists
-                    return {"labels": segmentations[example_idx].tolist()}
-                else:
-                    # return no change
+            if good_indices:
+                # Override (or inject) the labels (pseudo masks) in place for good samples:
+                def _override_mask(example, example_idx):
+                    if example_idx in good_indices:
+                        return {"labels": segmentations[example_idx].tolist()}
                     return {}
+                full_dataset_dict["train"] = full_dataset_dict["train"].map(
+                    _override_mask,
+                    with_indices=True,
+                )
+                # Update the pools
+                current_indices.extend(good_indices)
+                # Remove all evaluated indices from the unlabeled pool and add back the bad ones for re-evaluation
+                remaining_indices = [r for r in remaining_indices if r not in new_indices] + bad_indices
+                empty_iterations_count = 0
+                logger.info(f"Added {len(good_indices)} auto-labeled samples; remaining unlabeled: {len(remaining_indices)}")
+            else:
+                empty_iterations_count += 1
+                logger.info("No new samples met the IoU threshold in this iteration.")
+                
+        added = len(good_indices) if good_indices else 0
+        logger.info(f"Added {added} samples in this iteration.")
+                
+        current_percentage = min(max_percentage, (len(current_indices) / num_total_train) * 100.0)
+        logger.info(f"Current data percentage: {current_percentage:.2f} ({len(current_indices)} samples)")
+        current_data_percentage = current_percentage / 100.0
 
-            # this will go over your entire train split, but only rewrite the
-            # 'mask' for good_indices
-            full_dataset_dict["train"] = full_dataset_dict["train"].map(
-                _override_mask,
-                with_indices=True,
-            )
-            
-            # 3)  Now update your index pools:
-            #    — add only the good ones to the training set
-            current_indices.extend(good_indices)
-            #    — put *only* the bad ones back into the unlabeled pool
-            #      (everything else except good_indices stays out of the pool permanently)
-            remaining_indices = [r for r in remaining_indices if r not in new_indices] + bad_indices
-
-            logger.info(f"Added {len(good_indices)} auto-labeled samples, kept {len(bad_indices)} still unlabeled.")
-            
-        else:
-            # Create the training dataset FOR THIS ITERATION
-            current_train_subset = full_dataset_dict['train'].select(current_indices)
-            
+        # --- Prepare Training Subset for This Iteration ---
+        current_train_subset = full_dataset_dict['train'].select(current_indices)
         logger.info("Training subset preprocessing complete.")
 
-        # --- 6b. Setup Model and Trainer for Current Iteration ---
-        # Load model: Start fresh or from previous iteration's checkpoint
-        if current_model is None: # First iteration
+        # --- 6b. Setup Model and Trainer for This Iteration ---
+        if current_model is None:  # First iteration
             logger.info("Loading initial model...")
             current_model = load_model_for_segmentation(
                 model_name_or_path=config['model']['name'],
@@ -240,136 +272,90 @@ def run_active_learning_pipeline(config_path: str):
             )
         else:
             logger.info("Re-using model from previous iteration.")
-            # Optional: Re-initialize parts of the model if desired between steps
-            # e.g., re-init classifier layer? Requires careful consideration.
-            
         
-        # Define output dir and run name for THIS iteration
-        iter_output_dir = f"{output_dir_prefix}_iter_{target_percentage_int}"
-        iter_run_name = f"{run_name_prefix}_{target_percentage_int}pct"
+        iter_output_dir = f"{output_dir_prefix}_iter_{current_percentage}"
+        iter_run_name = f"{run_name_prefix}_{current_percentage}pct"
         os.makedirs(iter_output_dir, exist_ok=True)
-
-        # Setup W&B Run for this iteration (reinit=True is important)
-        # Pass the iteration-specific config/info if needed
-        iteration_config = copy.deepcopy(config) # Avoid modifying original config
-        iteration_config['active_learning']['current_percentage'] = current_data_percentage
-        iteration_config['active_learning']['current_step'] = current_al_step
+        
+        # Setup W&B Run for this iteration (if applicable)
+        iteration_config = copy.deepcopy(config)
+        iteration_config['active_learning']['current_percentage'] = (len(current_indices) / num_total_train) * 100.0 if iteration < 2 else current_data_percentage
+        iteration_config['active_learning']['current_step'] = iteration
         setup_wandb(iteration_config, run_name=iter_run_name, project_name=config.get('project_name'))
 
-        # Configure Training Arguments for THIS iteration
-        # Make a copy to avoid side effects if looping TrainingArguments object
+        # Configure TrainingArguments (same as before)
         iter_training_args = TrainingArguments(
             output_dir=str(iter_output_dir),
             run_name=str(iter_run_name),
-
-            # ints
             num_train_epochs=int(config['training']['num_train_epochs']),
             per_device_train_batch_size=int(config['training']['per_device_train_batch_size']),
             per_device_eval_batch_size=int(config['training']['per_device_eval_batch_size']),
             save_total_limit=int(config['training']['save_total_limit']),
             logging_steps=int(config['training']['logging_steps']),
             seed=int(config['seed']),
-
-            # floats
             learning_rate=float(config['training']['learning_rate']),
             weight_decay=float(config['training']['weight_decay']),
-
-            # strings
             eval_strategy=str(config['training']['evaluation_strategy']),
             save_strategy=str(config['training']['save_strategy']),
             metric_for_best_model=str(config['training']['metric_for_best_model']),
-
-            # booleans
             load_best_model_at_end=bool(config['training']['load_best_model_at_end']),
             remove_unused_columns=bool(config['training'].get('remove_unused_columns', False)),
             fp16=bool(config['training'].get('fp16', False) and torch.cuda.is_available()),
-
-            # logging / reporting
             logging_dir=os.path.join(iter_output_dir, 'logs'),
             logging_first_step=True,
             report_to=[x.strip() for x in str(config.get('log_with', 'none')).split(',') if x.strip()],
-
-            # never push these interim checkpoints
             push_to_hub=False
         )
 
-        # Initialize compute_metrics function (needed for Trainer)
         compute_metrics_fn = partial(
             compute_metrics_segmentation,
             num_labels=NUM_PASCAL_VOC_LABELS,
             ignore_index=255
         )
 
-        # AL callbacks
         al_progress_callback = ActiveLearningProgressCallback(
-            total_al_steps=total_al_steps,
-            current_al_step=current_al_step,
-            current_data_percentage=current_data_percentage
+            total_al_steps=None,  # Not applicable anymore
+            current_al_step=iteration,
+            current_data_percentage=current_data_percentage,
+            number_of_samples=len(current_train_subset),
+            total_number_of_samples=num_total_train,
         )
-        image_logger_callback = None
-
+        
         early_stopping_callback = EarlyStoppingCallback(
             early_stopping_patience=config['training'].get('early_stopping_patience', 3),
             early_stopping_threshold=config['training'].get('early_stopping_threshold', 0.0),
         )
 
-        # Initialize Trainer for THIS iteration
         trainer = Trainer(
-            model=current_model, # Pass the current model object
+            model=current_model,
             args=iter_training_args,
             train_dataset=current_train_subset,
-            eval_dataset=full_dataset_dict['validation'], # Use the FIXED validation set
+            eval_dataset=full_dataset_dict['validation'],
             compute_metrics=compute_metrics_fn,
-            callbacks=[al_progress_callback, early_stopping_callback, image_logger_callback] if image_logger_callback else [al_progress_callback, early_stopping_callback],
-            # No need to pass model_init if we reuse the model object
+            callbacks=[al_progress_callback, early_stopping_callback],
         )
-        if image_logger_callback:
-            image_logger_callback.trainer = trainer # Set trainer for the callback
-            image_logger_callback.train_dataset = current_train_subset # Set train dataset for logging
-            image_logger_callback.eval_dataset = full_dataset_dict['validation'] # Set eval dataset for logging
         
-        if config.get('debug', False):
-            logger.info("Debugging mode enabled. Logging a batch of data.")
-            # Log a batch of data
-            train_loader = trainer.get_train_dataloader()
-            batch = next(iter(train_loader))
-            imgs = batch["pixel_values"]   # tensor [B,3,H,W]
-            msks = batch["labels"]         # tensor [B,H,W]
-            debug_log_and_plot(imgs, msks, PASCAL_VOC_LABEL_NAMES)
-
-        # --- 6c. Train Model for Current Iteration ---
-        logger.info(f"Starting training for {target_percentage_int}% data...")
+        # --- 6c. Train and Evaluate This Iteration ---
+        logger.info(f"Starting training for {current_percentage}% data with {len(current_indices)} samples...")
         try:
-             trainer.train(
-                 # resume_from_checkpoint= 'path/to/checkpoint' # Can be used if needed
-                 # If Trainer reuses model object, weights are automatically carried over
-             )
-             logger.info(f"Training finished for {target_percentage_int}% data.")
+            trainer.train()
+            logger.info(f"Training finished for iteration {iteration} at {current_percentage}% data.")
         except Exception as e:
-             logger.error(f"Training failed at iteration {current_al_step} ({target_percentage_int}%): {e}", exc_info=True)
-             # TODO: Decide whether to continue or stop the loop
-             break # Stop the loop on training failure
+            logger.error(f"Training failed at iteration {iteration} ({current_percentage}%): {e}", exc_info=True)
+            break
 
-        # --- 6d. Evaluate and Log Metrics for Current Iteration ---
-        logger.info(f"Evaluating model on FIXED validation set (after {target_percentage_int}% training)...")
         eval_metrics = trainer.evaluate(eval_dataset=full_dataset_dict['validation'])
-        logger.info(f"Validation Metrics ({target_percentage_int}% data): {eval_metrics}")
+        logger.info(f"Validation Metrics ({current_percentage}% data): {eval_metrics}")
+        overall_metrics[current_percentage] = {k: v for k, v in eval_metrics.items() if isinstance(v, (int, float))}
+        
+        current_model = trainer.model  # Update model
 
-        # Store metrics for overall summary
-        # Ensure keys match what compute_metrics returns (e.g., 'eval_mean_iou')
-        metrics_to_store = {k: v for k, v in eval_metrics.items() if isinstance(v, (int, float))}
-        overall_metrics[target_percentage_int] = metrics_to_store
-
-        # Save the model checkpoint from this iteration (Trainer does this based on save_strategy)
-        # The best model (according to load_best_model_at_end) is kept in trainer.model
-        current_model = trainer.model # Update current_model to the best one from this iter
-
-        # Finish W&B run for this iteration ONLY if it's active
         if config.get('log_with') == 'wandb' and trainer.is_world_process_zero():
-             import wandb
-             # Log the eval metrics explicitly to the *current* run before finishing
-             wandb.log({f"final_eval_{k}": v for k, v in eval_metrics.items()})
-             wandb.finish() # Finish the per-iteration run
+            import wandb
+            wandb.log({f"final_eval_{k}": v for k, v in eval_metrics.items()})
+            wandb.finish()
+        
+        iteration += 1
 
     # --- 7. Final Evaluation on Test Set (using the model from the last iteration) ---
     if current_model and full_dataset_dict['test']:
@@ -439,4 +425,5 @@ if __name__ == "__main__":
         handlers=[logging.StreamHandler(sys.stdout)]
     )
     
+   
     run_active_learning_pipeline(args.config)
