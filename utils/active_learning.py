@@ -111,6 +111,50 @@ def compute_image_uncertainties(
                 model_segmentations[orig_idx] = seg_mask
     return uncertainties, model_segmentations
 
+
+def compute_segmentation_masks(
+    model,
+    dataset,
+    remaining_indices: List[int],
+    device,
+    batch_size: int = 8
+) -> Dict[int, np.ndarray]:
+    """
+    Returns:
+      model_segmentations: idx -> HxW numpy mask of model’s argmax
+    """
+    # Move model to device & set to eval
+    model.to(device)
+    model.eval()
+
+    # Subset the dataset and keep track of original indices
+    raw_subset = dataset.select(remaining_indices)
+    raw_subset = raw_subset.add_column("__orig_idx__", remaining_indices)
+
+    dl = DataLoader(
+        raw_subset,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model_segmentations: Dict[int, np.ndarray] = {}
+    # No softmax / entropy steps—just argmax on raw logits
+    with torch.no_grad():
+        for batch in dl:
+            pix       = batch["pixel_values"].to(device)  # [B,3,H,W]
+            orig_idxs = batch["__orig_idx__"].tolist()    # [B]
+            logits    = model(pix).logits                 # [B,C,H,W]
+
+            # Compute argmax mask for each image in the batch
+            # masks: [B,H,W] on CPU
+            masks = logits.argmax(dim=1).cpu().numpy()
+
+            # Store each mask under its original index
+            for idx, mask in zip(orig_idxs, masks):
+                model_segmentations[idx] = mask
+
+    return model_segmentations
+
 def mock_compute_image_uncertainties(
     model, # Mocked, not used
     dataset, # Mocked, not used

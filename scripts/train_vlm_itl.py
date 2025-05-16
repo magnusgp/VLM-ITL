@@ -44,7 +44,8 @@ from utils.active_learning import ( # For SegmentationImageLoggerCallbackVLM if 
     # ActiveLearningProgressCallback, 
     SegmentationImageLoggerCallback, # Or a VLM specific version
     compute_image_uncertainties,
-    mock_compute_image_uncertainties
+    mock_compute_image_uncertainties,
+    compute_segmentation_masks,
     # compute_mean_iou
 )
 from data.pascal_voc import (
@@ -67,47 +68,6 @@ try:
     import wandb
 except ImportError:
     wandb = None
-
-
-
-def calculate_prediction_certainty(
-    logits: torch.Tensor, # Upsampled logits (Batch=1, NumClasses, H, W)
-    pred_mask_np: np.ndarray, # Single predicted mask (H, W)
-    dominant_label_id: Optional[int],
-    ignore_index: int = 255
-) -> float:
-    """
-    Calculates certainty: average max probability for pixels of the dominant predicted class.
-    If no dominant class, or dominant class has no pixels, returns 0.
-    """
-    if dominant_label_id is None or dominant_label_id == -1 or dominant_label_id == ignore_index:
-        return 0.0
-
-    # Ensure logits are on the correct device, matching pred_mask_np if it becomes a tensor
-    # probs = torch.softmax(logits.squeeze(0), dim=0)  # (NumClasses, H, W)
-    
-    # For numerical stability with upsampled logits, ensure they are float32
-    probs = torch.softmax(logits.squeeze(0).float(), dim=0)
-
-
-    # Probabilities for the dominant class
-    # Ensure dominant_label_id is within bounds
-    if not (0 <= dominant_label_id < probs.shape[0]):
-        logger.warning(f"Dominant label ID {dominant_label_id} is out of bounds for probs shape {probs.shape}. Returning 0 certainty.")
-        return 0.0
-    dominant_class_probs = probs[dominant_label_id, :, :] # (H, W)
-    
-    # Mask for pixels belonging to the dominant class in the prediction
-    # Ensure pred_mask_np is on the same device as dominant_class_probs if it's converted to a tensor
-    dominant_class_pixel_mask = torch.from_numpy(pred_mask_np == dominant_label_id).to(dominant_class_probs.device)
-    
-    sum_mask = dominant_class_pixel_mask.sum()
-    if sum_mask == 0:
-        return 0.0 # No pixels predicted as the dominant class
-        
-    # Average probability for the dominant class over its predicted pixels
-    certainty = torch.sum(dominant_class_probs * dominant_class_pixel_mask) / sum_mask
-    return certainty.item()
 
 
 def run_vlm_itl_pipeline(config_path: str):
@@ -195,10 +155,9 @@ def run_vlm_itl_pipeline(config_path: str):
     )
     
     logger.info("Creating fixed validation and test set indices from raw_datasets['train']...")
-    train_indices, val_indices, test_indices = create_train_val_test_splits(
+    train_indices, val_indices = create_train_val_test_splits(
         raw_datasets['train'], 
         val_percentage=dataset_config.get('val_split_percentage', 0.1),
-        test_percentage=dataset_config.get('test_split_percentage', 0.1),
         seed=general_config['seed']
     )
     
@@ -212,22 +171,15 @@ def run_vlm_itl_pipeline(config_path: str):
         desc="Preprocessing raw training data"
     )
     full_dataset.set_format("torch", columns=["pixel_values", "labels"])
-    
-    # full_dataset_dict = DatasetDict({
-    #     'train': full_dataset.select(train_indices),
-    #     'validation': full_dataset.select(val_indices),
-    #     'test': full_dataset.select(test_indices)
-    # })
+
 
     processed_train_pool = full_dataset.select(train_indices)
     processed_val_dataset = full_dataset.select(val_indices)
-    processed_test_dataset = full_dataset.select(test_indices)
     raw_train_data_subset = raw_datasets['train'].select(train_indices)
     
     logger.info(f"Processed train pool size: {len(processed_train_pool)}")
     logger.info(f"Raw train data subset size (for pseudo-labeling source): {len(raw_train_data_subset)}")
     logger.info(f"Processed validation data size: {len(processed_val_dataset)}")
-    logger.info(f"Processed test data size: {len(processed_test_dataset)}")
 
     initial_train_percentage = vlm_config.get('initial_training_percentage', 0.05)
     num_initial_samples = math.ceil(initial_train_percentage * len(processed_train_pool))
@@ -250,13 +202,6 @@ def run_vlm_itl_pipeline(config_path: str):
     
 
     logger.info(f"Loading segmentation model")
-    # current_model = load_model_for_segmentation(
-    #     model_name_or_path=model_config['name'],
-    #     num_labels=num_labels,
-    #     id2label=id2label,
-    #     label2id=label2id,
-    #     ignore_mismatched_sizes=model_config.get('ignore_mismatched_sizes', True)
-    # )
     current_model = None
     
     current_training_indices = current_gt_labeled_indices.copy()
@@ -268,67 +213,26 @@ def run_vlm_itl_pipeline(config_path: str):
         
         # --- 5.A. Prepare Training Data for Current Iteration ---
         if unlabeled_indices and current_model is not None:
-            k = 100
-            if general_config["active_learning"]["sampling_strategy"] == "mock":
-                uncertainties, segmentations = mock_compute_image_uncertainties(
-                    model=current_model,
-                    dataset=processed_train_pool,
-                    remaining_indices=unlabeled_indices,
-                    preprocess_fn=shared_preprocess_fn,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    batch_size=training_config.get("per_device_eval_batch_size", 8),
-                )
-            else:
-                uncertainties, segmentations = compute_image_uncertainties(
-                    model=current_model,
-                    dataset=processed_train_pool,
-                    remaining_indices=unlabeled_indices,
-                    preprocess_fn=shared_preprocess_fn,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    batch_size=training_config.get("per_device_eval_batch_size", 8),
-                )
-            logger.info(f"Uncertainties calculated for {len(unlabeled_indices)} unlabeled samples.")
+
+            segmentations_preds = compute_segmentation_masks(
+                model=current_model,
+                dataset=processed_train_pool,
+                remaining_indices=unlabeled_indices,
+                device=device,
+                batch_size=training_config.get('per_device_eval_batch_size', 8),
+            )
+        
+            logger.info(f"Segmentation mask preds calculated for {len(unlabeled_indices)} unlabeled samples.")
             # Pick top-k by descending entropy
-            new_indicies = sorted(
-                uncertainties, 
-                key=lambda idx: uncertainties[idx], 
-                reverse=True,
-                # sort by ascending entropy instead for min_entropy
-                # reverse=True, 
-            )[:k]
-
-            # # Modify segmentations for new_indicies to keep only the dominant class
-            # for idx_to_modify in new_indicies:
-                    
-            #     current_mask_np = segmentations[idx_to_modify]
-            #     unique_classes, counts = np.unique(current_mask_np, return_counts=True)
-                
-            #     dominant_class_id = -1
-            #     max_count = -1
-            #     logger.info(f"Unique classes in mask {idx_to_modify}: {unique_classes}, counts: {counts}")
-            #     # Find the dominant foreground class
-            #     for class_id, count in zip(unique_classes, counts):
-            #         if class_id == PASCAL_VOC_IGNORE_INDEX or class_id == 0: # Ignore index or background
-            #             continue
-            #         if count > max_count:
-            #             max_count = count
-            #             dominant_class_id = class_id
-                
-            #     # Create new mask: fill with background (0), then add only dominant class pixels
-            #     new_mask_np = np.full(current_mask_np.shape, 0, dtype=current_mask_np.dtype) 
-            #     if dominant_class_id != -1: # If a dominant foreground class was found
-            #         new_mask_np[current_mask_np == dominant_class_id] = dominant_class_id
-
-            #     segmentations[idx_to_modify] = new_mask_np
-            # logger.info(f"Processed {len(new_indicies)} masks to keep only dominant foreground class.")
-
+            new_indicies = segmentations_preds.keys()
             good_indices = []
             bad_indices  = []
 
             for idx in new_indicies:
                 # Get the original image and segmentation mask as PIL images
                 original_image = raw_train_data_subset[idx][dataset_config['image_col']]
-                segmentation_mask = Image.fromarray(segmentations[idx].astype(np.uint8))
+                segmentation_mask = Image.fromarray(segmentations_preds[idx].astype(np.uint8))
+                logger.info(f"{processed_train_pool[idx]}")
                 true_mask = raw_train_data_subset[idx][dataset_config['mask_col']]
                 vlm_feed_back = vlm_handler.ask_binary_question(
                     image = original_image,
@@ -338,7 +242,7 @@ def run_vlm_itl_pipeline(config_path: str):
                     true_mask=true_mask,
                 )
                 if vlm_feed_back:
-                    logger.info(f"Dominant class ID: {np.unique(segmentations[idx])}, VLM feedback: {vlm_feed_back}, {idx}")
+                    logger.info(f"Dominant class ID: {np.unique(segmentations_preds[idx])}, VLM feedback: {vlm_feed_back}, {idx}")
                     good_indices.append(idx)
                 else:
                     bad_indices.append(idx)
@@ -404,7 +308,7 @@ def run_vlm_itl_pipeline(config_path: str):
             load_best_model_at_end=training_config.get('load_best_model_at_end_per_iter', True),
             remove_unused_columns=False,
             fp16=training_config.get('fp16', False) and torch.cuda.is_available(),
-            report_to=["wandb"] if general_config.get('log_with', False) and wandb else ["none"],
+            report_to=general_config['log_with'],
             seed=general_config['seed'],
             logging_dir=os.path.join(iter_output_dir, 'logs'),
             disable_tqdm=general_config.get('disable_tqdm', False),

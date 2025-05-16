@@ -103,32 +103,27 @@ def load_pascal_voc_dataset(
 def create_train_val_test_splits(
     full_dataset: Dataset,
     val_percentage: float = 0.1,
-    test_percentage: float = 0.1,
     seed: int = 42
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     Split a single HF Dataset into train/val/test subsets.
     """
     num_samples = len(full_dataset)
-    if val_percentage + test_percentage >= 1.0:
-        raise ValueError("Sum of val_percentage and test_percentage must be < 1.0")
 
     indices = list(range(num_samples))
     random.seed(seed)
     random.shuffle(indices)
 
-    num_test = int(num_samples * test_percentage)
     num_val  = int(num_samples * val_percentage)
 
-    test_indices = indices[:num_test]
-    val_indices  = indices[num_test : num_test + num_val]
-    train_indices = indices[num_test + num_val:]
+    val_indices  = indices[:num_val]
+    train_indices = indices[num_val:]
 
     logger.info(
         f"Split dataset → Train={len(train_indices)}, "
-        f"Val={len(val_indices)}, Test={len(test_indices)}"
+        f"Val={len(val_indices)}"
     )
-    return train_indices, val_indices, test_indices
+    return train_indices, val_indices
 
 
 # ────────────────────────────────────────────────────────────────────────────────
