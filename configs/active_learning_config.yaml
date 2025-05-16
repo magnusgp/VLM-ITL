@@ -45,6 +45,7 @@ training: # Params per Active Learning Iteration
 
 active_learning:
   initial_percentage: 0.05 # Start with 20% of training data
+  increment_percentage: 0.05 # Increment by 20% of training data
   max_percentage: 1.0 # Go up to 100%
   sampling_strategy: "min_entropy" # Options: "random", "min_entropy", "max_entropy"
   iou_threshold: 0.6 # for entropy sampling

@@ -181,8 +181,9 @@ def run_active_learning_pipeline(config_path: str):
     random.shuffle(all_train_indices)  # Consistent random sampling
 
     # Initial AL config parameters
-    current_percentage, max_percentage = sanity_check_percentages(
+    current_percentage, increment, max_percentage = sanity_check_percentages(
         al_config['initial_percentage'], 
+        al_config['increment_percentage'], 
         al_config['max_percentage']
     )
 
