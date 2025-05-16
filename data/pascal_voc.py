@@ -25,10 +25,25 @@ PASCAL_VOC_ID2LABEL = {i: label for i, label in enumerate(PASCAL_VOC_LABEL_NAMES
 PASCAL_VOC_LABEL2ID = {label: i for i, label in PASCAL_VOC_ID2LABEL.items()}
 NUM_PASCAL_VOC_LABELS = len(PASCAL_VOC_ID2LABEL)
 
+
+PASCAL_VOC_BINARY_LABEL_NAMES = [
+    "background", "foreground"
+]
+PASCAL_VOC_BINARY_ID2LABEL = {i: label for i, label in enumerate(PASCAL_VOC_BINARY_LABEL_NAMES)}
+PASCAL_VOC_BINARY_LABEL2ID = {label: i for i, label in PASCAL_VOC_BINARY_ID2LABEL.items()}
+NUM_PASCAL_VOC_BINARY_LABELS = len(PASCAL_VOC_BINARY_ID2LABEL)
+
+
 # Pixels with this value will be ignored by Cross‑Entropy
 PASCAL_VOC_IGNORE_INDEX = 255
 
 from PIL import Image
+
+PASCAL_VOC_BINARY_COLORS = [
+    (0, 0, 0),   # 0=background
+    (255, 255, 255)  # 1=foreground
+]
+
 
 PASCAL_VOC_COLORS = [
     (  0,   0,   0),  #  0=background
@@ -124,7 +139,8 @@ def preprocess_data(
     batch: Dict[str, Any],
     image_processor: SegformerImageProcessor,
     image_col: str = "image",
-    mask_col: str = "mask"
+    mask_col: str = "mask",
+    binary_segmentation_task: bool = False  # New parameter
 ) -> Dict[str, List[Any]]:
     """
     Preprocess a batch of Pascal VOC examples for segmentation.
@@ -133,6 +149,7 @@ def preprocess_data(
     - Converts the ground-truth RGB segmentation masks into
       class-index masks using the official VOC 21-color palette.
     - Marks any pixel whose color is not in the VOC palette as IGNORE_INDEX.
+    - If binary_segmentation_task is True, maps all foreground classes to 1.
     - Returns lists of pixel_values and label masks (len == batch_size).
 
     Args:
@@ -142,9 +159,12 @@ def preprocess_data(
               - "mask": List[PIL.Image] RGB segmentation masks
         image_processor (SegformerImageProcessor):
             Huggingface processor for resizing/normalizing images.
+        image_col (str): Name of the image column.
+        mask_col (str): Name of the mask column.
+        binary_segmentation_task (bool): If True, convert to binary segmentation.
 
     Returns:
-        Dict[str, List[Any]]: 
+        Dict[str, List[Any]]:
             {
               "pixel_values": List[np.ndarray] of shape (C,H,W),
               "labels":       List[np.ndarray] of shape (H,W) with dtype np.int64
@@ -193,6 +213,12 @@ def preprocess_data(
             matches = np.all(arr == color, axis=-1)
             if np.any(matches):
                 idx_map[matches] = class_id
+
+        # If binary segmentation, map all foreground classes to 1
+        if binary_segmentation_task:
+            # Foreground pixels are those not background (0) and not ignore_index
+            is_foreground = (idx_map != 0) & (idx_map != PASCAL_VOC_IGNORE_INDEX)
+            idx_map[is_foreground] = 1 # Map to class 1 (foreground)
 
         # Sanity check: ensure only valid IDs or IGNORE_INDEX appear
         unique_vals = np.unique(idx_map)
@@ -276,4 +302,3 @@ if __name__ == "__main__":
     plt.close("all")
     cv2.destroyAllWindows()
     exit(0)
-        

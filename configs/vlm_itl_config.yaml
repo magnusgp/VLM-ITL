@@ -12,10 +12,11 @@ dataset:
   mask_col: "mask"
   val_split_percentage: 0.1 # Use 10% of train as validation (fixed across iterations)
   test_split_percentage: 0.1 # Use 10% of train as test (fixed across iterations)
-  load_from_cache_file: True # Set to True to use cached dataset
+  load_from_cache_file: False # Set to True to use cached dataset
+  binary_segmentation: True # New option, default to False
 
 model:
-  name: "nvidia/segformer-b4-finetuned-ade-512-512"
+  name: "nvidia/segformer-b0-finetuned-ade-512-512"
   num_labels: 21
   ignore_mismatched_sizes: True
 

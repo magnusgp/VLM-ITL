@@ -55,7 +55,10 @@ from data.pascal_voc import (
     PASCAL_VOC_ID2LABEL,
     PASCAL_VOC_LABEL2ID,
     NUM_PASCAL_VOC_LABELS,
-    PASCAL_VOC_IGNORE_INDEX
+    PASCAL_VOC_IGNORE_INDEX,
+    PASCAL_VOC_BINARY_ID2LABEL,
+    PASCAL_VOC_BINARY_LABEL2ID,
+    NUM_PASCAL_VOC_BINARY_LABELS
 )
 from models.segformer import load_model_for_segmentation
 
@@ -151,6 +154,7 @@ def run_vlm_itl_pipeline(config_path: str):
     try:
         vlm_handler_config = vlm_config.get('vlm_handler', {})
         vlm_handler_config['debug_dir'] = os.path.join(config['run_name_prefix'], 'vlm_debug')
+        vlm_handler_config['binary_segmentation'] = dataset_config['binary_segmentation']
         vlm_handler = HuggingFaceVLMHandler(vlm_handler_config)
     except Exception as e:
         logger.error(f"Failed to initialize VLM Handler: {e}", exc_info=True)
@@ -169,12 +173,25 @@ def run_vlm_itl_pipeline(config_path: str):
         dataset_config['feature_extractor_name'],
         do_reduce_labels=False 
     )
-    
+
+    binary_segmentation_task = dataset_config.get('binary_segmentation', False)
+    if binary_segmentation_task:
+        num_labels = NUM_PASCAL_VOC_BINARY_LABELS
+        id2label = PASCAL_VOC_BINARY_ID2LABEL
+        label2id = PASCAL_VOC_BINARY_LABEL2ID
+    else:
+        num_labels = NUM_PASCAL_VOC_LABELS
+        id2label = PASCAL_VOC_ID2LABEL
+        label2id = PASCAL_VOC_LABEL2ID
+
+    logger.info(f"Binary segmentation task: {binary_segmentation_task}")
+
     shared_preprocess_fn = partial(
         preprocess_data, 
         image_processor=image_processor,
         image_col=dataset_config['image_col'],
-        mask_col=dataset_config['mask_col']
+        mask_col=dataset_config['mask_col'],
+        binary_segmentation_task=binary_segmentation_task  # Pass the new parameter
     )
     
     logger.info("Creating fixed validation and test set indices from raw_datasets['train']...")
@@ -196,11 +213,11 @@ def run_vlm_itl_pipeline(config_path: str):
     )
     full_dataset.set_format("torch", columns=["pixel_values", "labels"])
     
-    full_dataset_dict = DatasetDict({
-        'train': full_dataset.select(train_indices),
-        'validation': full_dataset.select(val_indices),
-        'test': full_dataset.select(test_indices)
-    })
+    # full_dataset_dict = DatasetDict({
+    #     'train': full_dataset.select(train_indices),
+    #     'validation': full_dataset.select(val_indices),
+    #     'test': full_dataset.select(test_indices)
+    # })
 
     processed_train_pool = full_dataset.select(train_indices)
     processed_val_dataset = full_dataset.select(val_indices)
@@ -235,12 +252,12 @@ def run_vlm_itl_pipeline(config_path: str):
     logger.info(f"Loading segmentation model")
     current_model = load_model_for_segmentation(
         model_name_or_path=model_config['name'],
-        num_labels=NUM_PASCAL_VOC_LABELS,
-        id2label=PASCAL_VOC_ID2LABEL,
-        label2id=PASCAL_VOC_LABEL2ID,
+        num_labels=num_labels,
+        id2label=id2label,
+        label2id=label2id,
         ignore_mismatched_sizes=model_config.get('ignore_mismatched_sizes', True)
     )
-    current_model = None
+    # current_model = None
     
     current_training_indices = current_gt_labeled_indices.copy()
     for iteration in range(num_vlm_iterations):
@@ -363,9 +380,9 @@ def run_vlm_itl_pipeline(config_path: str):
             logger.info("Loading initial model...")
             current_model = load_model_for_segmentation(
                 model_name_or_path=config['model']['name'],
-                num_labels=NUM_PASCAL_VOC_LABELS,
-                id2label=PASCAL_VOC_ID2LABEL,
-                label2id=PASCAL_VOC_LABEL2ID,
+                num_labels=num_labels,
+                id2label=id2label,
+                label2id=label2id,
                 ignore_mismatched_sizes=config['model'].get('ignore_mismatched_sizes', False)
             )
         current_model.to(device)
@@ -397,7 +414,7 @@ def run_vlm_itl_pipeline(config_path: str):
 
         compute_metrics_fn = partial(
             compute_metrics_segmentation,
-            num_labels=NUM_PASCAL_VOC_LABELS,
+            num_labels=num_labels,
             ignore_index=255
         )
                     

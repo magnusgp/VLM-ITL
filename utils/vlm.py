@@ -6,7 +6,7 @@ import random
 import torch
 import numpy as np
 import os # Added for path operations
-from data.pascal_voc import PASCAL_VOC_COLORS, PASCAL_VOC_IGNORE_INDEX
+from data.pascal_voc import PASCAL_VOC_COLORS, PASCAL_VOC_IGNORE_INDEX, PASCAL_VOC_BINARY_COLORS
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,13 @@ class HuggingFaceVLMHandler(VLMHandler):
         super().__init__(config)
         # self.pipeline = None
 
+        self.color_map = PASCAL_VOC_COLORS
+        self.ignore_index = PASCAL_VOC_IGNORE_INDEX
+        if self.config["binary_segmentation"]:
+            # Use binary colors for segmentation
+            self.color_map = PASCAL_VOC_BINARY_COLORS
+
+
     def _load_model(self):
         try:
             from transformers import pipeline # Ensure pipeline is imported here
@@ -245,8 +252,8 @@ class HuggingFaceVLMHandler(VLMHandler):
                         continue
                     
                     # Check if class_idx is valid for PASCAL_VOC_COLORS
-                    if 0 < class_idx_val < len(PASCAL_VOC_COLORS):
-                        color_rgb = PASCAL_VOC_COLORS[class_idx_val]
+                    if 0 < class_idx_val < len(self.color_map):
+                        color_rgb = self.color_map[class_idx_val]
                         color_rgba = (*color_rgb, highlight_alpha)
                         
                         # Find pixels belonging to this class
@@ -287,7 +294,7 @@ class HuggingFaceVLMHandler(VLMHandler):
                 if processed_segmentation_mask_pil:
                     mask_for_colorizing_np = np.array(processed_segmentation_mask_pil.convert('L'))
                     rgb_mask_np = np.zeros((mask_for_colorizing_np.shape[0], mask_for_colorizing_np.shape[1], 3), dtype=np.uint8)
-                    for class_idx_val, color in enumerate(PASCAL_VOC_COLORS):
+                    for class_idx_val, color in enumerate(self.color_map):
                         if class_idx_val == PASCAL_VOC_IGNORE_INDEX: # Should not happen if mask is clean
                             continue
                         rgb_mask_np[mask_for_colorizing_np == class_idx_val] = color

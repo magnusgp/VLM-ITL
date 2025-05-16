@@ -109,6 +109,7 @@ def compute_image_uncertainties(
                 # grab the argmax mask and move it to CPU + numpy
                 seg_mask = logits[i].argmax(dim=0).cpu().numpy()  # [H,W]
                 model_segmentations[orig_idx] = seg_mask
+            break
     return uncertainties, model_segmentations
 
 def mock_compute_image_uncertainties(
